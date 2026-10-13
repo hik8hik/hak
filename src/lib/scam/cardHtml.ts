@@ -1,3 +1,10 @@
+// NOTE: chart findings carry a `chart: ChartSpec` (plain data).
+// They are not rendered into this string-based HTML. Instead, when
+// a chart card is exported, the export captures the live DOM, which
+// already contains the rendered Recharts SVG. Exporting chart cards
+// via the string path (rasteriseHtml) will show the card without a
+// chart — use the live-DOM path (rasteriseCloned) for chart cards.
+
 import type { ExportPreset } from "@/lib/types";
 import type { ScamFinding, ScamSeverity } from "./types";
 

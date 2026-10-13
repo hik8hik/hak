@@ -25,7 +25,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
         <meta name="google" content="notranslate" />
         <script dangerouslySetInnerHTML={{ __html: THEME_BOOT }} />
       </head>
-      <body>
+      <body suppressHydrationWarning>
         <SettingsProvider>
           <ScriptSettingsProvider>
             <QueueProvider>{children}</QueueProvider>

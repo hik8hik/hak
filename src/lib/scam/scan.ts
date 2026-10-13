@@ -8,6 +8,8 @@ import { analyzeJsBundles } from "./jsbundles";
 import { analyzeHosting } from "./hosting";
 import { analyzeNews } from "./news";
 import { composeNarrative } from "./report";
+import { buildChartSet } from "./charts";
+import { runAiResearch, aiResearchConfigured } from "./ai-research";
 import { findPlatform, isPlatformBrand } from "./platforms";
 import { BRANDS } from "./brands";
 import {
@@ -149,6 +151,20 @@ export async function scanUrl(input: string): Promise<ScanReport> {
     platform: platformInfo, ai: null,
   };
 
+  // Charts \u2014 deterministic, derived from the same findings.
+  const chartSets = buildChartSet(base)
+  const chartFindings: ScamFinding[] = chartSets.map((c) => ({
+    id: c.id, kind: "chart", title: c.title, summary: c.caption,
+    severity: c.severity, confidence: "high",
+    chart: c.spec, chartCaption: c.caption,
+  }))
+
+  // AI research \u2014 runs in parallel with nothing else; produces cards only.
+  let aiResearchFindings: ScamFinding[] = []
+  if (aiResearchConfigured()) {
+    try { aiResearchFindings = await runAiResearch(base) } catch (e) { console.warn("[hak/scam] ai research failed:", e) }
+  }
+
   const { narrative, ai } = await composeNarrative(base)
 
   const narrativeFinding: ScamFinding = {
@@ -162,8 +178,8 @@ export async function scanUrl(input: string): Promise<ScanReport> {
   // Order: verdict, platform (if any), narrative, then the rest.
   const rest = findings.filter((f) => f !== v)
   const ordered = platformInfo
-    ? [v, platformFinding(platformInfo), narrativeFinding, ...rest]
-    : [v, narrativeFinding, ...rest]
+    ? [v, platformFinding(platformInfo), narrativeFinding, ...chartFindings, ...rest, ...aiResearchFindings]
+    : [v, narrativeFinding, ...chartFindings, ...rest, ...aiResearchFindings]
 
   return {
     ...base,

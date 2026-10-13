@@ -1,5 +1,6 @@
 "use client";
 import type { ScamFinding } from "@/lib/scam/types";
+import ScamChartRenderer from "./ScamChartRenderer";
 
 const SEV_COLOR: Record<string, string> = {
   critical: "var(--cs-critical)",
@@ -24,6 +25,19 @@ export default function ScamFindingCard({ finding }: { finding: ScamFinding }) {
       </div>
       <h3 style={{ fontSize: isVerdict ? 22 : 17 }}>{finding.title}</h3>
       <p>{finding.summary}</p>
+      {finding.chart && (
+        <div
+          style={{
+            marginTop: 12,
+            padding: "16px 10px",
+            background: "var(--surface-2)",
+            borderRadius: 12,
+            overflow: "hidden",
+          }}
+        >
+          <ScamChartRenderer spec={finding.chart} />
+        </div>
+      )}
       {finding.evidence && finding.evidence.length > 0 && (
         <div style={{ display: "flex", flexDirection: "column", gap: 4, marginTop: 4 }}>
           {finding.evidence.map((row, i) => (

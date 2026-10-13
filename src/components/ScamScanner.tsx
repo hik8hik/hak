@@ -71,6 +71,8 @@ export default function ScamScanner() {
   const [presetId, setPresetId] = useState("post4k")
   const [exportBusy, setExportBusy] = useState(false)
   const [exportProgress, setExportProgress] = useState(0)
+  const [researchBusy, setResearchBusy] = useState(false)
+  const [researchError, setResearchError] = useState<string | null>(null)
 
   const preset = PRESETS.find((p) => p.id === presetId) || PRESETS[2]
 
@@ -95,6 +97,17 @@ export default function ScamScanner() {
       }
       const data = (await r.json()) as ScanReport
       setReport(data)
+      void fetch("/api/scam/research", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ report: data }),
+      })
+        .then((rr) => rr.json())
+        .then((rr) => {
+          if (!rr || !Array.isArray(rr.findings) || rr.findings.length === 0) return
+          setReport((prev) => prev ? { ...prev, findings: [...prev.findings, ...rr.findings] } : prev)
+        })
+        .catch((e) => setResearchError(String(e)))
     } catch (e) {
       setError(String(e))
     } finally {

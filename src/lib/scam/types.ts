@@ -4,7 +4,7 @@ export type ScamConfidence = "high" | "medium" | "low";
 export type ScamKind =
   | "verdict" | "narrative" | "lexical" | "whois" | "dns" | "tls"
   | "reputation" | "host" | "html" | "jsbundles" | "hosting"
-  | "news" | "impersonation" | "platform";
+  | "news" | "impersonation" | "platform" | "ai-research" | "chart";
 
 export interface EvidenceRow {
   label: string;
@@ -27,6 +27,10 @@ export interface ScamFinding {
   raw?: unknown;
   /** Set when the finding was suppressed because of platform context. */
   skippedReason?: string;
+  /** Inline SVG, present on kind="chart" findings. */
+  chart?: ChartSpec;
+  /** Caption under the chart. */
+  chartCaption?: string;
 }
 
 export interface PlatformInfo {
@@ -74,3 +78,16 @@ export const CONFIDENCE_MULT: Record<ScamConfidence, number> = {
 };
 
 export const SEVERITY_ORDER: ScamSeverity[] = ["critical", "high", "medium", "low", "info"];
+
+
+// ─── Chart specification ──────────────────────────────────────
+// Plain data; rendered by ScamChartRenderer using Recharts.
+
+export type ChartSpec =
+  | { type: "gauge"; score: number; severity: ScamSeverity }
+  | { type: "radar"; axes: { label: string; value: number; severity: ScamSeverity }[] }
+  | { type: "domainAge"; ageDays: number | null }
+  | { type: "reputation"; total: number; malicious: number; suspicious: number; harmless: number; undetected: number }
+  | { type: "dnsChecklist"; items: { label: string; present: boolean }[] }
+  | { type: "tlsValidity"; validFrom: string; validTo: string }
+  | { type: "evidenceWeight"; rows: { title: string; severity: ScamSeverity; weight: number }[] };
