@@ -1,0 +1,104 @@
+import { parseUrl, analyzeLexical } from "./parse";
+import { runDns } from "./dns";
+import { runRdap } from "./rdap";
+import { runTls } from "./tls";
+import { runReputation } from "./reputation";
+import { SEVERITY_WEIGHT, type ScanReport, type ScamFinding, type ScamSeverity, type EvidenceRow } from "./types";
+
+function scoreFindings(findings: ScamFinding[]): { score: number; verdict: string; verdictSeverity: ScamSeverity } {
+  let raw = 0;
+  for (const f of findings) raw += SEVERITY_WEIGHT[f.severity] || 0;
+  const score = Math.min(100, raw);
+  let verdict: string;
+  let verdictSeverity: ScamSeverity;
+  if (score >= 70) {
+    verdict = "Multiple strong indicators of phishing or malicious activity. Do not interact with this page.";
+    verdictSeverity = "critical";
+  } else if (score >= 40) {
+    verdict = "Several concerning signals detected. Treat with caution and investigate further before visiting.";
+    verdictSeverity = "high";
+  } else if (score >= 15) {
+    verdict = "Some suspicious characteristics were found, but the evidence is not conclusive.";
+    verdictSeverity = "medium";
+  } else if (score > 0) {
+    verdict = "A few minor observations. Nothing strongly indicates malicious intent.";
+    verdictSeverity = "low";
+  } else {
+    verdict = "No suspicious characteristics detected in the layers we could reach.";
+    verdictSeverity = "info";
+  }
+  return { score, verdict, verdictSeverity };
+}
+
+function buildVerdictFinding(score: number, verdict: string, severity: ScamSeverity, findings: ScamFinding[]): ScamFinding {
+  const counts: Record<string, number> = { critical: 0, high: 0, medium: 0, low: 0, info: 0 };
+  for (const f of findings) counts[f.severity] = (counts[f.severity] || 0) + 1;
+  const evidence: EvidenceRow[] = [
+    { label: "Risk score", value: score + "/100" },
+    { label: "Critical findings", value: String(counts.critical), bad: counts.critical > 0 },
+    { label: "High findings", value: String(counts.high), bad: counts.high > 0 },
+    { label: "Medium findings", value: String(counts.medium) },
+    { label: "Low findings", value: String(counts.low) },
+    { label: "Informational", value: String(counts.info) },
+  ];
+  return {
+    id: "verdict", kind: "verdict",
+    title: "Verdict",
+    summary: verdict,
+    severity,
+    evidence,
+  };
+}
+
+export async function scanUrl(input: string): Promise<ScanReport> {
+  const t0 = Date.now();
+  const parsed = parseUrl(input);
+  const findings: ScamFinding[] = [];
+
+  // Lexical is synchronous and can run immediately.
+  const lex = analyzeLexical(parsed);
+  findings.push(lex.finding);
+
+  if (!parsed.url) {
+    const s = scoreFindings(findings);
+    const verdict = buildVerdictFinding(s.score, s.verdict, s.verdictSeverity, findings);
+    findings.unshift(verdict);
+    return {
+      url: input, normalizedUrl: input, hostname: "", registrableDomain: "",
+      scannedAt: new Date().toISOString(),
+      score: s.score, verdict: s.verdict, verdictSeverity: s.verdictSeverity,
+      findings, durationMs: Date.now() - t0,
+    };
+  }
+
+  // Everything else in parallel. Each layer is defensive; failures
+  // resolve to a low-severity finding rather than throwing.
+  const [dnsR, rdapR, tlsR, repFindings] = await Promise.all([
+    runDns(parsed.hostname, parsed.registrableDomain),
+    runRdap(parsed.registrableDomain),
+    runTls(parsed.hostname),
+    runReputation(parsed.normalized, parsed.hostname),
+  ]);
+
+  findings.push(rdapR.finding)
+  findings.push(dnsR.finding)
+  findings.push(tlsR.finding)
+  for (const f of repFindings) findings.push(f)
+
+  const s = scoreFindings(findings)
+  const verdict = buildVerdictFinding(s.score, s.verdict, s.verdictSeverity, findings)
+  findings.unshift(verdict)
+
+  return {
+    url: input,
+    normalizedUrl: parsed.normalized,
+    hostname: parsed.hostname,
+    registrableDomain: parsed.registrableDomain,
+    scannedAt: new Date().toISOString(),
+    score: s.score,
+    verdict: s.verdict,
+    verdictSeverity: s.verdictSeverity,
+    findings,
+    durationMs: Date.now() - t0,
+  };
+}

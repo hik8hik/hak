@@ -1,0 +1,16 @@
+let ctx: AudioContext | null = null;
+function ac(): AudioContext | null {
+  if (typeof window === "undefined") return null;
+  if (!ctx) { try { ctx = new (window.AudioContext || (window as any).webkitAudioContext)(); } catch { return null; } }
+  return ctx;
+}
+function tone(freq: number, dur: number, gain = 0.03) {
+  const a = ac(); if (!a) return;
+  const o = a.createOscillator(); const g = a.createGain();
+  o.frequency.value = freq; o.type = "square";
+  g.gain.value = gain;
+  o.connect(g); g.connect(a.destination);
+  o.start(); o.stop(a.currentTime + dur);
+}
+export function playTick() { tone(1200, 0.012); }
+export function playBeep() { tone(660, 0.12); }

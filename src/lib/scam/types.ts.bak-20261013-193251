@@ -1,0 +1,51 @@
+export type ScamSeverity = "critical" | "high" | "medium" | "low" | "info";
+
+export type ScamKind =
+  | "verdict"
+  | "lexical"
+  | "whois"
+  | "dns"
+  | "tls"
+  | "reputation"
+  | "host";
+
+export interface EvidenceRow {
+  label: string;
+  value: string;
+  /** Renders with a red left border when true. */
+  bad?: boolean;
+}
+
+export interface ScamFinding {
+  id: string;
+  kind: ScamKind;
+  title: string;
+  summary: string;
+  severity: ScamSeverity;
+  evidence?: EvidenceRow[];
+  references?: string[];
+  raw?: unknown;
+}
+
+export interface ScanReport {
+  url: string;
+  normalizedUrl: string;
+  hostname: string;
+  registrableDomain: string;
+  scannedAt: string;
+  score: number;
+  verdict: string;
+  verdictSeverity: ScamSeverity;
+  findings: ScamFinding[];
+  durationMs: number;
+}
+
+export const SEVERITY_WEIGHT: Record<ScamSeverity, number> = {
+  critical: 40,
+  high: 20,
+  medium: 8,
+  low: 3,
+  info: 0,
+};
+
+export const SEVERITY_ORDER: ScamSeverity[] = ["critical", "high", "medium", "low", "info"];

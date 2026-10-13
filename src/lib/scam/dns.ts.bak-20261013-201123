@@ -1,0 +1,111 @@
+import type { EvidenceRow, ScamFinding } from "./types";
+
+const DOH = "https://cloudflare-dns.com/dns-query";
+
+interface DohAnswer { name: string; type: number; TTL: number; data: string; }
+interface DohResponse { Status: number; Answer?: DohAnswer[]; Authority?: DohAnswer[]; }
+
+const TYPE_NAMES: Record<number, string> = {
+  1: "A", 2: "NS", 5: "CNAME", 6: "SOA", 15: "MX", 16: "TXT",
+  28: "AAAA", 257: "CAA",
+};
+
+async function queryDoh(name: string, type: string): Promise<DohAnswer[]> {
+  try {
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), 4500);
+    const r = await fetch(
+      DOH + "?name=" + encodeURIComponent(name) + "&type=" + type,
+      { headers: { Accept: "application/dns-json" }, cache: "no-store", signal: ctrl.signal },
+    );
+    clearTimeout(t);
+    if (!r.ok) return [];
+    const j = (await r.json()) as DohResponse;
+    return j.Answer || [];
+  } catch { return []; }
+}
+
+export interface DnsResult {
+  finding: ScamFinding;
+  a: string[];
+  aaaa: string[];
+  ns: string[];
+  mx: string[];
+  txt: string[];
+  caa: string[];
+  spf: string | null;
+  dmarc: string | null;
+}
+
+export async function runDns(hostname: string, registrable: string): Promise<DnsResult> {
+  if (!hostname || /^\d+\.\d+\.\d+\.\d+$/.test(hostname)) {
+    return {
+      finding: {
+        id: "dns", kind: "dns", title: "DNS records",
+        summary: "Hostname is an IP address; DNS lookup skipped.",
+        severity: "info",
+      },
+      a: [], aaaa: [], ns: [], mx: [], txt: [], caa: [], spf: null, dmarc: null,
+    };
+  }
+
+  const [a, aaaa, ns, mx, txt, caa, dmarcTxt] = await Promise.all([
+    queryDoh(hostname, "A"),
+    queryDoh(hostname, "AAAA"),
+    queryDoh(registrable, "NS"),
+    queryDoh(registrable, "MX"),
+    queryDoh(registrable, "TXT"),
+    queryDoh(registrable, "CAA"),
+    queryDoh("_dmarc." + registrable, "TXT"),
+  ]);
+
+  const aList = a.filter((r) => r.type === 1).map((r) => r.data);
+  const aaaaList = aaaa.filter((r) => r.type === 28).map((r) => r.data);
+  const nsList = ns.filter((r) => r.type === 2).map((r) => r.data.replace(/\.$/, ""));
+  const mxList = mx.filter((r) => r.type === 15).map((r) => r.data);
+  const txtList = txt.filter((r) => r.type === 16).map((r) => r.data.replace(/^"|"$/g, ""));
+  const caaList = caa.filter((r) => r.type === 257).map((r) => r.data);
+  const spf = txtList.find((t) => t.toLowerCase().startsWith("v=spf1")) || null;
+  const dmarcRaw = dmarcTxt.filter((r) => r.type === 16).map((r) => r.data.replace(/^"|"$/g, ""));
+  const dmarc = dmarcRaw.find((t) => t.toLowerCase().startsWith("v=dmarc1")) || null;
+
+  const evidence: EvidenceRow[] = [];
+  const flags: string[] = [];
+
+  if (aList.length) evidence.push({ label: "A records", value: aList.join(", ") });
+  else { flags.push("no-a"); evidence.push({ label: "A records", value: "none", bad: true }); }
+  if (aaaaList.length) evidence.push({ label: "AAAA records", value: aaaaList.join(", ") });
+  if (nsList.length) evidence.push({ label: "Nameservers", value: nsList.join(", ") });
+  if (mxList.length) evidence.push({ label: "MX records", value: mxList.join(", ") });
+  else {
+    flags.push("no-mx");
+    evidence.push({ label: "MX records", value: "none — domain cannot receive email", bad: true });
+  }
+
+  if (spf) evidence.push({ label: "SPF", value: spf });
+  else { flags.push("no-spf"); evidence.push({ label: "SPF", value: "not configured", bad: true }); }
+
+  if (dmarc) evidence.push({ label: "DMARC", value: dmarc });
+  else { flags.push("no-dmarc"); evidence.push({ label: "DMARC", value: "not configured", bad: true }); }
+
+  if (caaList.length) evidence.push({ label: "CAA", value: caaList.join(" | ") });
+  else { flags.push("no-caa"); evidence.push({ label: "CAA", value: "not configured — any CA may issue", bad: true }); }
+
+  let severity: ScamFinding["severity"] = "info"
+  if (flags.includes("no-a")) severity = "high"
+  else if (flags.length >= 3) severity = "medium"
+  else if (flags.length) severity = "low"
+
+  const summary = flags.length
+    ? flags.length + " DNS/email-authentication gap(s) detected."
+    : "DNS records are complete: A, MX, SPF, DMARC and CAA all present."
+
+  return {
+    finding: {
+      id: "dns", kind: "dns", title: "DNS & email authentication",
+      summary, severity, evidence,
+    },
+    a: aList, aaaa: aaaaList, ns: nsList, mx: mxList, txt: txtList, caa: caaList,
+    spf, dmarc,
+  };
+}

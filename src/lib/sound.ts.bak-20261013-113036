@@ -1,0 +1,248 @@
+"use client";
+
+// Keystroke audio engine for hak.
+//
+// - Prefers real WAVs in /sounds/ if present.
+// - Falls back to OfflineAudioContext synthesis (noise burst + thud).
+// - Two use modes: preview (speaker) and recorder (MediaStreamAudioDestination).
+
+let cachedCtx: AudioContext | null = null;
+
+export function getAudioContext(): AudioContext {
+  if (typeof window === "undefined") throw new Error("no window");
+  if (!cachedCtx) {
+    const AC: typeof AudioContext =
+      (window as any).AudioContext || (window as any).webkitAudioContext;
+    if (!AC) throw new Error("WebAudio unavailable");
+    cachedCtx = new AC();
+  }
+  return cachedCtx;
+}
+
+async function loadWav(ctx: AudioContext, url: string): Promise<AudioBuffer | null> {
+  try {
+    const r = await fetch(url, { cache: "force-cache" });
+    if (!r.ok) return null;
+    const buf = await r.arrayBuffer();
+    if (buf.byteLength < 64) return null;
+    return await ctx.decodeAudioData(buf);
+  } catch { return null; }
+}
+
+type ClickPreset = "down" | "space" | "enter";
+
+async function synthesizeClick(ctx: AudioContext, preset: ClickPreset): Promise<AudioBuffer> {
+  const durSec = preset === "space" ? 0.14 : preset === "enter" ? 0.19 : 0.11;
+  const sr = ctx.sampleRate;
+  const oac = new OfflineAudioContext(1, Math.round(sr * durSec), sr);
+
+  // Noise burst through a bandpass — the "click" body.
+  const n = Math.round(sr * durSec);
+  const noiseBuf = oac.createBuffer(1, n, sr);
+  const nd = noiseBuf.getChannelData(0);
+  for (let i = 0; i < n; i++) nd[i] = Math.random() * 2 - 1;
+  const noise = oac.createBufferSource();
+  noise.buffer = noiseBuf;
+  const bp = oac.createBiquadFilter();
+  bp.type = "bandpass";
+  bp.frequency.value = preset === "space" ? 1700 : 3200;
+  bp.Q.value = 1.05;
+  const ng = oac.createGain();
+  ng.gain.setValueAtTime(0, 0);
+  ng.gain.linearRampToValueAtTime(preset === "enter" ? 0.75 : 0.55, 0.0006);
+  ng.gain.exponentialRampToValueAtTime(0.001, durSec * 0.35);
+  noise.connect(bp); bp.connect(ng); ng.connect(oac.destination);
+  noise.start(0);
+
+  // Low thud — the switch bottoming out.
+  const osc = oac.createOscillator();
+  osc.type = "sine";
+  osc.frequency.value = preset === "space" ? 140 : preset === "enter" ? 110 : 170;
+  const og = oac.createGain();
+  og.gain.setValueAtTime(0, 0);
+  og.gain.linearRampToValueAtTime(preset === "enter" ? 0.42 : 0.30, 0.002);
+  og.gain.exponentialRampToValueAtTime(0.001, durSec * 0.42);
+  osc.connect(og); og.connect(oac.destination);
+  osc.start(0); osc.stop(durSec);
+
+  return await oac.startRendering();
+}
+
+interface SampleSet {
+  click: AudioBuffer[];
+  space: AudioBuffer;
+  enter: AudioBuffer;
+  backspace: AudioBuffer;
+  custom: boolean;
+}
+
+let cachedSamples: SampleSet | null = null;
+
+async function loadSamples(ctx: AudioContext): Promise<SampleSet> {
+  if (cachedSamples) return cachedSamples;
+
+  const click: AudioBuffer[] = [];
+  for (let i = 1; i <= 8; i++) {
+    const url = "/sounds/click-" + String(i).padStart(2, "0") + ".wav";
+    const b = await loadWav(ctx, url);
+    if (b) click.push(b);
+  }
+  const spaceC = await loadWav(ctx, "/sounds/space.wav");
+  const enterC = await loadWav(ctx, "/sounds/enter.wav");
+  const bsC = await loadWav(ctx, "/sounds/backspace.wav");
+
+  const usedCustom = click.length > 0;
+  if (!usedCustom) {
+    click.push(await synthesizeClick(ctx, "down"));
+    click.push(await synthesizeClick(ctx, "down"));
+    click.push(await synthesizeClick(ctx, "down"));
+    click.push(await synthesizeClick(ctx, "down"));
+  }
+  const space = spaceC ?? (usedCustom ? click[0] : await synthesizeClick(ctx, "space"));
+  const enter = enterC ?? (usedCustom ? click[0] : await synthesizeClick(ctx, "enter"));
+  const backspace = bsC ?? click[0];
+
+  cachedSamples = { click, space, enter, backspace, custom: usedCustom };
+  return cachedSamples;
+}
+
+export class KeystrokeBank {
+  private ctx: AudioContext;
+  private out: AudioNode;
+  private samples: SampleSet | null = null;
+  private masterGain: number;
+
+  constructor(ctx: AudioContext, out: AudioNode, masterGain = 0.75) {
+    this.ctx = ctx;
+    this.out = out;
+    this.masterGain = masterGain;
+  }
+
+  async load(): Promise<void> {
+    this.samples = await loadSamples(this.ctx);
+  }
+
+  get isCustom(): boolean { return !!this.samples?.custom; }
+
+  /** Schedule a click for `char` at absolute AudioContext time `when`. */
+  schedule(char: string, when: number): void {
+    const s = this.samples;
+    if (!s) return;
+    let buf: AudioBuffer;
+    if (char === " ") buf = s.space;
+    else if (char === "\n" || char === "\r") buf = s.enter;
+    else if (char === "\b") buf = s.backspace;
+    else buf = s.click[(Math.random() * s.click.length) | 0];
+    const src = this.ctx.createBufferSource();
+    src.buffer = buf;
+    const g = this.ctx.createGain();
+    g.gain.value = this.masterGain;
+    src.connect(g); g.connect(this.out);
+    src.start(Math.max(when, this.ctx.currentTime));
+  }
+
+  /** Convenience: fire-and-forget on the current tick. */
+  play(char: string): void {
+    this.schedule(char, this.ctx.currentTime);
+  }
+}
+
+let previewBank: KeystrokeBank | null = null;
+
+export async function getPreviewBank(): Promise<KeystrokeBank> {
+  if (previewBank) return previewBank;
+  const ctx = getAudioContext();
+  const bank = new KeystrokeBank(ctx, ctx.destination, 0.55);
+  await bank.load();
+  previewBank = bank;
+  return bank;
+}
+
+export async function makeRecorderBank(): Promise<{ bank: KeystrokeBank; stream: MediaStream }> {
+  const ctx = getAudioContext();
+  const dest = ctx.createMediaStreamDestination();
+  const bank = new KeystrokeBank(ctx, dest, 0.85);
+  await bank.load();
+  return { bank, stream: dest.stream };
+}
+
+// Back-compat shims — anything still importing these gets a sensible no-op
+// tone through the shared audio context.
+export function playTick(): void {
+  void (async () => {
+    try { const b = await getPreviewBank(); b.play("x"); } catch {}
+  })();
+}
+export function playBeep(): void {
+  void (async () => {
+    try { const b = await getPreviewBank(); b.play("\n"); } catch {}
+  })();
+}
+// ────────────────────────────────────────────────────────────────────
+// PluckKit — pitched tones for the converge simulation.
+//
+// A "pluck" is a fast triangle wave with a tiny pitch drop and a
+// high-pass, which reads as a marimba or kalimba. Pitch is chosen from
+// a C-major pentatonic scale so any random sequence stays musical.
+// ────────────────────────────────────────────────────────────────────
+
+const PENTATONIC = [0, 2, 4, 7, 9, 12, 14, 16, 19, 21, 24, 26, 28, 31, 33, 36];
+
+export function pluckFreqForX(xNorm: number, rootHz = 261.63): number {
+  const t = Math.max(0, Math.min(1, (xNorm + 1) / 2));
+  const idx = Math.round(t * (PENTATONIC.length - 1));
+  return rootHz * Math.pow(2, PENTATONIC[idx] / 12);
+}
+
+export function pluckFreqForHue(hue: number, rootHz = 261.63): number {
+  const t = ((hue % 360) + 360) % 360 / 360;
+  const idx = Math.round(t * (PENTATONIC.length - 1));
+  return rootHz * Math.pow(2, PENTATONIC[idx] / 12);
+}
+
+export class PluckKit {
+  private ctx: AudioContext;
+  private out: AudioNode;
+  private gain: number;
+
+  constructor(ctx: AudioContext, out: AudioNode, gain = 0.22) {
+    this.ctx = ctx;
+    this.out = out;
+    this.gain = gain;
+  }
+
+  play(freq: number, when?: number, duration = 0.34) {
+    const t = when ?? this.ctx.currentTime;
+    const osc = this.ctx.createOscillator();
+    osc.type = "triangle";
+    osc.frequency.setValueAtTime(freq, t);
+    osc.frequency.exponentialRampToValueAtTime(freq * 0.985, t + duration);
+    const g = this.ctx.createGain();
+    g.gain.setValueAtTime(0, t);
+    g.gain.linearRampToValueAtTime(this.gain, t + 0.004);
+    g.gain.exponentialRampToValueAtTime(0.0008, t + duration);
+    const hp = this.ctx.createBiquadFilter();
+    hp.type = "highpass";
+    hp.frequency.value = 180;
+    osc.connect(hp);
+    hp.connect(g);
+    g.connect(this.out);
+    osc.start(t);
+    osc.stop(t + duration + 0.05);
+  }
+}
+
+let previewPluck: PluckKit | null = null;
+
+export function getPreviewPluck(): PluckKit {
+  if (previewPluck) return previewPluck;
+  const ctx = getAudioContext();
+  previewPluck = new PluckKit(ctx, ctx.destination, 0.16);
+  return previewPluck;
+}
+
+export function makeRecorderPluck(): { kit: PluckKit; stream: MediaStream } {
+  const ctx = getAudioContext();
+  const dest = ctx.createMediaStreamDestination();
+  return { kit: new PluckKit(ctx, dest, 0.28), stream: dest.stream };
+}

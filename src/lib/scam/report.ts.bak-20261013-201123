@@ -1,0 +1,170 @@
+import type { ScanReport, ScamFinding } from "./types";
+
+interface Context {
+  domainAgeDays: number | null;
+  registrar: string | null;
+  hostingCountry: string | null;
+  hostingOrg: string | null;
+  isCloudflare: boolean;
+  brandMentions: string[];
+  kenyanTokens: string[];
+  socialHandles: string[];
+  hasAdminPanel: boolean;
+  hasKyc: boolean;
+  hasMpesa: boolean;
+  hasInstallApp: boolean;
+  hasExternalForm: boolean;
+  hasExternalEmail: boolean;
+  reputationHits: number;
+  dnsGaps: number;
+  newsHits: number;
+  typosquat: string | null;
+}
+
+function collectContext(report: ScanReport): Context {
+  const ctx: Context = {
+    domainAgeDays: null, registrar: null,
+    hostingCountry: null, hostingOrg: null, isCloudflare: false,
+    brandMentions: [], kenyanTokens: [], socialHandles: [],
+    hasAdminPanel: false, hasKyc: false, hasMpesa: false, hasInstallApp: false,
+    hasExternalForm: false, hasExternalEmail: false,
+    reputationHits: 0, dnsGaps: 0, newsHits: 0,
+    typosquat: null,
+  };
+
+  for (const f of report.findings) {
+    if (f.kind === "whois") {
+      const ageRow = f.evidence?.find((r) => r.label === "Registered");
+      if (ageRow) {
+        const m = ageRow.value.match(/(\d+) days old/);
+        if (m) ctx.domainAgeDays = Number(m[1]);
+      }
+      const regRow = f.evidence?.find((r) => r.label === "Registrar");
+      if (regRow) ctx.registrar = regRow.value;
+    }
+    if (f.kind === "hosting") {
+      const countryRow = f.evidence?.find((r) => r.label === "Country");
+      if (countryRow) ctx.hostingCountry = countryRow.value;
+      const orgRow = f.evidence?.find((r) => r.label === "Organization");
+      if (orgRow) ctx.hostingOrg = orgRow.value;
+      const cfRow = f.evidence?.find((r) => r.label === "Fronting" && r.value.startsWith("behind Cloudflare"));
+      if (cfRow) ctx.isCloudflare = true;
+    }
+    if (f.kind === "html") {
+      const brandRow = f.evidence?.find((r) => r.label === "Brands mentioned");
+      if (brandRow) ctx.brandMentions = brandRow.value.split(",").map((s) => s.trim()).filter(Boolean);
+      const keRow = f.evidence?.find((r) => r.label === "Kenyan brand tokens");
+      if (keRow) ctx.kenyanTokens = keRow.value.split(",").map((s) => s.trim()).filter(Boolean);
+      const installRow = f.evidence?.find((r) => r.label === "Install-app prompts");
+      if (installRow) ctx.hasInstallApp = true;
+      const extFormRow = f.evidence?.find((r) => r.label === "Forms POST to external domain");
+      if (extFormRow) ctx.hasExternalForm = true;
+      const extEmailRow = f.evidence?.find((r) => r.label === "Contact email on other domain");
+      if (extEmailRow) ctx.hasExternalEmail = true;
+    }
+    if (f.kind === "jsbundles") {
+      const assets = f.evidence?.find((r) => r.label === "Suspicious asset names")?.value || "";
+      if (/admin[-_]?(?:login|panel|payouts|plans|dashboard)/i.test(assets)) ctx.hasAdminPanel = true;
+      if (/kyc[-_]?(?:gate|form|upload)/i.test(assets)) ctx.hasKyc = true;
+      if (/mpesa|mobile[-_]?money/i.test(assets)) ctx.hasMpesa = true;
+    }
+    if (f.kind === "reputation" && f.severity !== "info") ctx.reputationHits += 1;
+    if (f.kind === "dns" && f.severity !== "info") ctx.dnsGaps += 1;
+    if (f.kind === "news" && f.severity === "critical") ctx.newsHits = f.evidence?.length || 0;
+    if (f.kind === "lexical") {
+      const typoRow = f.evidence?.find((r) => r.label === "Typosquat candidate" && r.bad);
+      if (typoRow) {
+        const m = typoRow.value.match(/from brand [\u201c"]([^\u201d"]+)[\u201d"]/);
+        if (m) ctx.typosquat = m[1];
+      }
+    }
+  }
+  return ctx;
+}
+
+function sentenceDomainAge(ctx: Context): string {
+  if (ctx.domainAgeDays === null) return "";
+  if (ctx.domainAgeDays < 30) return "The domain is " + ctx.domainAgeDays + " days old, which is inconsistent with any legitimate financial platform.";
+  if (ctx.domainAgeDays < 180) return "The domain is less than six months old.";
+  return "";
+}
+
+function sentenceImpersonation(ctx: Context): string {
+  if (ctx.typosquat) {
+    return "The registrable domain is a lookalike for \u201c" + ctx.typosquat + "\u201d, a name it does not own.";
+  }
+  if (ctx.brandMentions.length && !ctx.brandMentions.every((b) => false)) {
+    return "The page prominently references " + ctx.brandMentions.slice(0, 3).join(", ") + " without being part of any of those brands' domains.";
+  }
+  if (ctx.kenyanTokens.length) {
+    return "It invokes " + ctx.kenyanTokens.slice(0, 3).join(", ") + " branding, all of which are Kenyan financial institutions or infrastructure.";
+  }
+  return "";
+}
+
+function sentenceHarvest(ctx: Context): string {
+  const bits: string[] = [];
+  if (ctx.hasKyc) bits.push("a KYC (Know Your Customer) document collection flow");
+  if (ctx.hasAdminPanel) bits.push("an operational back-office with login, payout, and plan-management assets");
+  if (ctx.hasMpesa) bits.push("M-PESA API hooks");
+  if (ctx.hasInstallApp) bits.push("prompts to install an app outside any official store");
+  if (!bits.length) return "";
+  return "Bundled JavaScript reveals " + bits.join(", ") + ". This is a functional platform built to collect and process user data, not a static marketing page.";
+}
+
+function sentenceReputation(ctx: Context): string {
+  if (ctx.reputationHits >= 3) return "Multiple external reputation sources have flagged this domain.";
+  if (ctx.reputationHits > 0) return "At least one external reputation source has flagged this domain.";
+  return "";
+}
+
+function sentenceDns(ctx: Context): string {
+  if (ctx.dnsGaps >= 3) return "DNS and email authentication records (MX, SPF, DMARC, CAA) are missing, which is consistent with a throwaway domain rather than a maintained service.";
+  if (ctx.dnsGaps > 0) return "Some DNS or email-authentication records are missing.";
+  return "";
+}
+
+function sentenceHosting(ctx: Context): string {
+  if (ctx.isCloudflare && ctx.hostingCountry) return "The origin server is hidden behind Cloudflare (" + ctx.hostingCountry + "), masking the operator.";
+  if (ctx.hostingCountry) return "Hosting resolves to " + ctx.hostingCountry + ".";
+  return "";
+}
+
+function sentenceNews(ctx: Context): string {
+  if (ctx.newsHits > 0) return "Public warnings and news coverage already exist for this domain or the brands it impersonates.";
+  return "";
+}
+
+function sentenceClosing(ctx: Context, score: number, severity: string): string {
+  if (score >= 70 || severity === "critical") return "Treat the domain as hostile. Do not enter credentials, PINs, or personal documents.";
+  if (score >= 40) return "Investigate further before interacting. Do not submit personal information.";
+  if (score >= 15) return "Some signals warrant caution. Verify through the brand's official channels before proceeding.";
+  return "No strong indicators detected in the reachable layers. This is not a clean bill of health \u2014 verify any financial transaction directly with the brand.";
+}
+
+export function composeNarrative(report: ScanReport): string {
+  const ctx = collectContext(report);
+  const parts: string[] = [];
+
+  // Opening verdict
+  if (report.verdictSeverity === "critical") parts.push("This is very likely a scam.");
+  else if (report.verdictSeverity === "high") parts.push("This has multiple strong indicators of fraud.");
+  else if (report.verdictSeverity === "medium") parts.push("This has some suspicious characteristics.");
+  else if (report.verdictSeverity === "low") parts.push("This has minor observations worth noting.");
+  else parts.push("No strong indicators detected in the reachable layers.");
+
+  const composed = [
+    sentenceDomainAge(ctx),
+    sentenceImpersonation(ctx),
+    sentenceHarvest(ctx),
+    sentenceReputation(ctx),
+    sentenceDns(ctx),
+    sentenceHosting(ctx),
+    sentenceNews(ctx),
+  ].filter(Boolean);
+
+  if (composed.length) parts.push(composed.join(" "));
+  parts.push(sentenceClosing(ctx, report.score, report.verdictSeverity));
+
+  return parts.join(" ");
+}

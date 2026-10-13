@@ -1,0 +1,123 @@
+import type { ThreatItem, Severity } from "./types";
+import { FALLBACK } from "./fallback";
+
+const REVALIDATE = 86400;
+const ATTACK_URL = "https://raw.githubusercontent.com/mitre-attack/attack-stix-data/master/enterprise-attack/enterprise-attack.json";
+const KEV_URL = "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json";
+const NVD_URL = "https://services.nvd.nist.gov/rest/json/cves/2.0";
+const CWE_URL = "https://cwe-api.mitre.org/api/v1/cwe/weakness";
+
+function mapSeverity(s: number | undefined): Severity {
+  if (s == null) return "none";
+  if (s >= 9) return "critical"; if (s >= 7) return "high";
+  if (s >= 4) return "medium"; if (s > 0) return "low"; return "none";
+}
+async function safeJson<T>(url: string): Promise<T | null> {
+  try {
+    const r = await fetch(url, { next: { revalidate: REVALIDATE } } as any);
+    if (!r.ok) return null;
+    return (await r.json()) as T;
+  } catch { return null; }
+}
+
+export async function fetchCve(id: string): Promise<ThreatItem | null> {
+  const data = await safeJson<any>(`${NVD_URL}?cveId=${encodeURIComponent(id)}`);
+  const v = data?.vulnerabilities?.[0]?.cve;
+  if (!v) return null;
+  const desc: string = v.descriptions?.find((d: any) => d.lang === "en")?.value ?? "";
+  const m = v.metrics ?? {};
+  const cvss = (m.cvssMetricV31 || m.cvssMetricV30 || m.cvssMetricV2 || [])[0];
+  return { id: v.id, kind: "cve", title: desc.split(".")[0] || v.id, summary: desc,
+    severity: mapSeverity(cvss?.cvssData?.baseScore),
+    references: (v.references || []).map((r: any) => r.url), raw: v };
+}
+export async function fetchRecentCves(count = 20): Promise<ThreatItem[]> {
+  const data = await safeJson<any>(`${NVD_URL}?resultsPerPage=${count}`);
+  return (data?.vulnerabilities ?? []).map((entry: any) => {
+    const v = entry.cve;
+    const desc: string = v.descriptions?.find((d: any) => d.lang === "en")?.value ?? "";
+    const m = v.metrics ?? {};
+    const cvss = (m.cvssMetricV31 || m.cvssMetricV30 || [])[0];
+    return { id: v.id, kind: "cve" as const, title: desc.split(".")[0] || v.id, summary: desc,
+      severity: mapSeverity(cvss?.cvssData?.baseScore),
+      references: (v.references || []).map((r: any) => r.url), raw: v };
+  });
+}
+export async function fetchCwe(id: string): Promise<ThreatItem | null> {
+  const num = id.replace(/^CWE-/i, "");
+  const data = await safeJson<any>(`${CWE_URL}/${num}`);
+  if (!data) return null;
+  const w = data.Weaknesses?.[0] || data;
+  return { id: `CWE-${num}`, kind: "cwe", title: w.Name || `CWE-${num}`,
+    summary: w.Description || "", severity: "high", raw: w };
+}
+export async function fetchCweTop25(): Promise<ThreatItem[]> {
+  const ids = [79, 787, 89, 416, 78, 20, 125, 22, 434, 94, 863, 829, 732, 611, 476,
+    502, 190, 798, 400, 306, 362, 269, 862, 918, 77];
+  const items = await Promise.all(ids.map((n) => fetchCwe(String(n))));
+  return items.filter(Boolean) as ThreatItem[];
+}
+let kevCache: { at: number; data: ThreatItem[] } | null = null;
+export async function fetchKev(): Promise<ThreatItem[]> {
+  if (kevCache && Date.now() - kevCache.at < 60_000) return kevCache.data;
+  const data = await safeJson<any>(KEV_URL);
+  const items: ThreatItem[] = (data?.vulnerabilities ?? []).slice(-60).reverse().map((v: any) => ({
+    id: v.cveID, kind: "kev" as const,
+    title: `${v.vendorProject} ${v.product} — ${v.vulnerabilityName}`,
+    summary: v.shortDescription || "", severity: "critical" as const,
+    references: [KEV_URL], raw: v,
+  }));
+  kevCache = { at: Date.now(), data: items };
+  return items;
+}
+let attackCache: { at: number; data: any } | null = null;
+async function loadAttackBundle(): Promise<any> {
+  if (attackCache && Date.now() - attackCache.at < 3_600_000) return attackCache.data;
+  const data = await safeJson<any>(ATTACK_URL);
+  if (data) attackCache = { at: Date.now(), data };
+  return data;
+}
+export async function fetchAttackTechnique(id: string): Promise<ThreatItem | null> {
+  const bundle = await loadAttackBundle();
+  const objs: any[] = bundle?.objects ?? [];
+  const ext = (o: any) => (o.external_references || []).find((r: any) => r.source_name === "mitre-attack")?.external_id;
+  const t = objs.find((o) => o.type === "attack-pattern" && ext(o)?.toUpperCase() === id.toUpperCase());
+  if (!t) return null;
+  const tactics = (t.kill_chain_phases || []).map((k: any) =>
+    String(k.phase_name || "").replace(/-/g, " ").replace(/\b\w/g, (c: string) => c.toUpperCase()));
+  return { id, kind: "attack", title: t.name, summary: t.description || "",
+    severity: "high", tactics, platforms: t.x_mitre_platforms || [], raw: t };
+}
+export async function fetchAttackByTactic(): Promise<ThreatItem[]> {
+  const bundle = await loadAttackBundle();
+  const objs: any[] = bundle?.objects ?? [];
+  const ext = (o: any) => (o.external_references || []).find((r: any) => r.source_name === "mitre-attack")?.external_id;
+  return objs.filter((o) => o.type === "attack-pattern" && !o.revoked && !o.x_mitre_deprecated)
+    .slice(0, 60).map((t) => ({
+      id: ext(t) || t.id, kind: "attack" as const, title: t.name,
+      summary: (t.description || "").slice(0, 260) + "…",
+      severity: "high" as const,
+      tactics: (t.kill_chain_phases || []).map((k: any) =>
+        String(k.phase_name || "").replace(/-/g, " ").replace(/\b\w/g, (c: string) => c.toUpperCase())),
+      platforms: t.x_mitre_platforms || [], raw: t,
+    }));
+}
+export async function getThreatById(id: string): Promise<ThreatItem | null> {
+  if (!id) return null;
+  const q = id.toUpperCase().trim();
+  if (/^CVE-\d{4}-\d+$/.test(q)) return (await fetchCve(q)) ?? FALLBACK[0];
+  if (/^T\d{4}(\.\d{3})?$/.test(q)) return (await fetchAttackTechnique(q)) ?? FALLBACK.find((x) => x.id === q) ?? null;
+  if (/^CWE-\d+$/.test(q)) return (await fetchCwe(q)) ?? FALLBACK.find((x) => x.id === q) ?? null;
+  if (q === "KEV") return (await fetchKev())[0] ?? FALLBACK[0];
+  const needle = q.toLowerCase();
+  return FALLBACK.find((x) => x.title.toLowerCase().includes(needle) || x.id.toLowerCase().includes(needle)) ?? null;
+}
+export async function getFeed(source: string): Promise<ThreatItem[]> {
+  try {
+    if (source === "kev") { const x = await fetchKev(); return x.length ? x : FALLBACK; }
+    if (source === "attack") { const x = await fetchAttackByTactic(); return x.length ? x : FALLBACK; }
+    if (source === "cwe") { const x = await fetchCweTop25(); return x.length ? x : FALLBACK; }
+    const x = await fetchRecentCves();
+    return x.length ? x : FALLBACK;
+  } catch { return FALLBACK; }
+}

@@ -1,0 +1,188 @@
+"use client";
+import { useEffect, useRef, useState } from "react";
+import { useScriptSettings, type RenderMode } from "@/context/ScriptSettingsContext";
+import { PRESETS } from "@/lib/types";
+import { rasterise, download } from "@/lib/export";
+import { playTick, playBeep } from "@/lib/sound";
+import { carouselSlides } from "@/lib/carousel";
+import JSZip from "jszip";
+import RenderTerminal from "./RenderTerminal";
+import RenderCode from "./RenderCode";
+import RenderDiff from "./RenderDiff";
+import RenderChain from "./RenderChain";
+import RenderHexdump from "./RenderHexdump";
+import RenderYara from "./RenderYara";
+import RenderRunbook from "./RenderRunbook";
+import RenderPcap from "./RenderPcap";
+
+const RENDER_MODES: RenderMode[] = [
+  "terminal","code","diff","chain","hexdump","yara","runbook","pcap",
+];
+const STUDIO_THEMES = [
+  { id: "terminal-green", name: "Terminal Green", fg: "#00ff41", bg: "#000000" },
+  { id: "amber-crt",      name: "Amber CRT",      fg: "#ffcc00", bg: "#1a0f00" },
+  { id: "blood-red",      name: "Blood Red",      fg: "#ff3344", bg: "#0a0000" },
+  { id: "matrix-rain",    name: "Matrix Rain",    fg: "#00ff41", bg: "#050f05" },
+  { id: "corporate-blue", name: "Corporate Blue", fg: "#7BA5FF", bg: "#0d1117" },
+  { id: "nord",           name: "Nord",           fg: "#d8dee9", bg: "#2e3440" },
+  { id: "dracula",        name: "Dracula",        fg: "#f8f8f2", bg: "#282a36" },
+];
+
+export default function StudioShell() {
+  const { s, set, reset } = useScriptSettings();
+  const [text, setText] = useState("nmap -sV -Pn 10.0.0.0/24\ncurl -s http://target/.env\nprintf '%s' $TOKEN | base64 -d");
+  const [patched, setPatched] = useState("nmap -sV -Pn 10.0.0.0/24\ncurl -s https://target/.env --proto =https --tlsv1.2\nprintf '%s' \"$TOKEN\" | base64 -d")
+  const [drawerOpen, setDrawerOpen] = useState(false);
+  const [typing, setTyping] = useState(false);
+  const [typedCount, setTypedCount] = useState(0);
+  const previewRef = useRef<HTMLDivElement>(null);
+  const lines = text.split("\n");
+
+  useEffect(() => {
+    if (!typing) { setTypedCount(lines.length); return; }
+    setTypedCount(0);
+    let i = 0;
+    const t = setInterval(() => {
+      i += 1; setTypedCount(i); playTick();
+      if (i >= lines.length) { clearInterval(t); playBeep(); }
+    }, 420);
+    return () => clearInterval(t);
+  }, [typing, text]);
+
+  async function exportOne(presetId: string) {
+    const p = PRESETS.find((x) => x.id === presetId);
+    if (!p || !previewRef.current) return;
+    const url = await rasterise(previewRef.current, { width: p.w, height: p.h, pixelRatio: p.pr });
+    download(url, `hak-payload-${p.id}.png`);
+  }
+  async function exportPerLine() {
+    const zip = new JSZip();
+    const p = PRESETS.find((x) => x.id === s.exportPreset) || PRESETS[0];
+    for (let i = 0; i < lines.length; i++) {
+      const url = await rasterise(previewRef.current!, { width: p.w, height: p.h, pixelRatio: p.pr });
+      const b64 = url.split(",")[1];
+      zip.file(`line-${String(i + 1).padStart(3, "0")}.png`, b64, { base64: true });
+    }
+    const blob = await zip.generateAsync({ type: "blob" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = "hak-payload-studio.zip";
+    a.click();
+  }
+  async function exportCarousel() {
+    const zip = new JSZip();
+    const slides = carouselSlides(text);
+    for (let i = 0; i < slides.length; i++) {
+      const url = await rasterise(previewRef.current!, { width: 1080, height: 1350, pixelRatio: 2 });
+      const b64 = url.split(",")[1];
+      zip.file(`slide-${String(i + 1).padStart(2, "0")}.png`, b64, { base64: true });
+    }
+    const blob = await zip.generateAsync({ type: "blob" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = "hak-carousel.zip";
+    a.click();
+  }
+  function exportAnimated() {
+    // TODO(hak/v2): MediaRecorder pipeline. Stubbed in v1.
+    alert("Animated export is on the roadmap — the static pipeline ships first.");
+  }
+
+  const activeTheme = STUDIO_THEMES.find((t) => t.id === s.theme) || STUDIO_THEMES[0];
+  const previewStyle: React.CSSProperties = {
+    background: s.transparent ? "transparent" : activeTheme.bg,
+    color: activeTheme.fg,
+    padding: s.padding, borderRadius: s.borderRadius,
+    fontFamily: s.fontFamily, fontSize: s.fontSize, fontWeight: s.fontWeight,
+    letterSpacing: s.letterSpacing, lineHeight: s.lineHeight, textAlign: s.textAlign,
+  } as React.CSSProperties;
+  const visibleLines = lines.slice(0, Math.max(1, typedCount));
+
+  return (
+    <div className="studio">
+      <div className="pane raised">
+        <div className="row">
+          <strong>Input</strong>
+          <div className="spacer" />
+          <button className="btn" onClick={() => setDrawerOpen(true)}>Studio settings</button>
+        </div>
+        <textarea value={text} onChange={(e) => setText(e.target.value)} spellCheck={false} />
+        {s.renderMode === "diff" && (
+          <>
+            <div className="small muted">Patched (right column)</div>
+            <textarea value={patched} onChange={(e) => setPatched(e.target.value)} spellCheck={false} style={{ minHeight: 90 }} />
+          </>
+        )}
+        <div className="tabs">
+          {RENDER_MODES.map((m) => (
+            <button key={m} className="btn" data-active={s.renderMode === m} onClick={() => set("renderMode", m)}>{m}</button>
+          ))}
+        </div>
+        <div className="tabs">
+          {PRESETS.map((p) => (
+            <button key={p.id} className="btn" data-active={s.exportPreset === p.id} onClick={() => set("exportPreset", p.id)}>{p.label}</button>
+          ))}
+        </div>
+        <div className="tabs">
+          <button className="btn" data-active={typing} onClick={() => setTyping((v) => !v)}>Typing preview</button>
+          <button className="btn" onClick={() => exportOne(s.exportPreset)}>Export current</button>
+          <button className="btn" onClick={exportPerLine}>Per-line ZIP</button>
+          <button className="btn" onClick={exportCarousel}>Carousel</button>
+          <button className="btn" onClick={exportAnimated} title="WebM/GIF — v2">Animated…</button>
+        </div>
+      </div>
+      <div className="pane raised">
+        <div className="row">
+          <strong>Preview</strong>
+          <div className="spacer" />
+          <span className="small muted">{s.renderMode}</span>
+        </div>
+        <div className="preview">
+          <div ref={previewRef} className={`render ${s.renderMode}`} style={previewStyle}>
+            {s.renderMode === "terminal" && <RenderTerminal lines={visibleLines} />}
+            {s.renderMode === "code" && <RenderCode text={text} />}
+            {s.renderMode === "diff" && <RenderDiff left={text} right={patched} />}
+            {s.renderMode === "chain" && <RenderChain lines={lines} />}
+            {s.renderMode === "hexdump" && <RenderHexdump text={text} />}
+            {s.renderMode === "yara" && <RenderYara text={text} />}
+            {s.renderMode === "runbook" && <RenderRunbook lines={lines} />}
+            {s.renderMode === "pcap" && <RenderPcap text={text} />}
+          </div>
+        </div>
+      </div>
+
+      <aside className="drawer" data-open={drawerOpen ? "true" : "false"}>
+        <div className="row">
+          <strong>Studio</strong>
+          <div className="spacer" />
+          <button className="btn" onClick={() => setDrawerOpen(false)}>Close</button>
+        </div>
+        <h4>Theme</h4>
+        <div className="seg" style={{ flexWrap: "wrap" }}>
+          {STUDIO_THEMES.map((t) => (
+            <button key={t.id} data-active={s.theme === t.id} onClick={() => set("theme", t.id)}>{t.name}</button>
+          ))}
+        </div>
+        <h4>Typography</h4>
+        <div className="row"><label>Font</label>
+          <select value={s.fontFamily} onChange={(e) => set("fontFamily", e.target.value)}>
+            <option>JetBrains Mono</option><option>Fira Code</option>
+            <option>IBM Plex Mono</option><option>Cascadia Code</option>
+            <option>Source Code Pro</option><option>Roboto Mono</option>
+          </select>
+        </div>
+        <div className="row"><label>Size</label><input type="range" min={10} max={36} value={s.fontSize} onChange={(e) => set("fontSize", +e.target.value)} /><span className="small muted">{s.fontSize}px</span></div>
+        <div className="row"><label>Weight</label><input type="range" min={300} max={800} step={100} value={s.fontWeight} onChange={(e) => set("fontWeight", +e.target.value)} /></div>
+        <div className="row"><label>Tracking</label><input type="range" min={-1} max={4} step={0.1} value={s.letterSpacing} onChange={(e) => set("letterSpacing", +e.target.value)} /></div>
+        <div className="row"><label>Line height</label><input type="range" min={1} max={2.4} step={0.05} value={s.lineHeight} onChange={(e) => set("lineHeight", +e.target.value)} /></div>
+        <h4>Layout</h4>
+        <div className="row"><label>Padding</label><input type="range" min={0} max={80} value={s.padding} onChange={(e) => set("padding", +e.target.value)} /></div>
+        <div className="row"><label>Radius</label><input type="range" min={0} max={40} value={s.borderRadius} onChange={(e) => set("borderRadius", +e.target.value)} /></div>
+        <div className="row"><label>Transparent</label><input type="checkbox" checked={s.transparent} onChange={(e) => set("transparent", e.target.checked)} /></div>
+        <h4>Sound</h4>
+        <div className="row"><label>Key ticks</label><input type="checkbox" checked={s.soundOn} onChange={(e) => set("soundOn", e.target.checked)} /></div>
+        <div className="row"><button className="btn" onClick={reset}>Reset studio</button></div>
+      </aside>
+    </div>
+  );
+}

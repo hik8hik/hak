@@ -1,0 +1,106 @@
+import type { EvidenceRow, ScamFinding } from "./types";
+
+interface RdapEvent { eventAction: string; eventDate: string; }
+interface RdapEntity { roles?: string[]; vcardArray?: unknown[]; }
+interface RdapNs { ldhName?: string; }
+interface Rdap {
+  ldhName?: string;
+  status?: string[];
+  events?: RdapEvent[];
+  entities?: RdapEntity[];
+  nameservers?: RdapNs[];
+  secureDNS?: { delegationSigned?: boolean };
+}
+
+function registrarName(entity: RdapEntity): string | null {
+  const vc = entity.vcardArray;
+  if (!Array.isArray(vc) || vc.length < 2) return null;
+  const rows = vc[1];
+  if (!Array.isArray(rows)) return null;
+  for (const row of rows as any[][]) {
+    if (Array.isArray(row) && row[0] === "fn" && row.length >= 4) return String(row[3]);
+  }
+  return null;
+}
+
+function daysBetween(iso: string): number | null {
+  const t = Date.parse(iso);
+  if (Number.isNaN(t)) return null;
+  return Math.floor((Date.now() - t) / (1000 * 60 * 60 * 24));
+}
+
+export interface RdapResult {
+  finding: ScamFinding;
+  ageDays: number | null;
+  registrar: string | null;
+}
+
+export async function runRdap(registrable: string): Promise<RdapResult> {
+  let data: Rdap | null = null;
+  let error: string | null = null;
+  try {
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), 8000);
+    const r = await fetch("https://rdap.org/domain/" + encodeURIComponent(registrable), {
+      headers: { Accept: "application/rdap+json, application/json" },
+      cache: "no-store",
+      signal: ctrl.signal,
+    });
+    clearTimeout(t);
+    if (r.ok) data = (await r.json()) as Rdap;
+    else error = "RDAP HTTP " + r.status;
+  } catch (e) { error = String(e); }
+
+  if (!data) {
+    return {
+      finding: {
+        id: "whois", kind: "whois", title: "Registration (RDAP)",
+        summary: "No RDAP record available: " + (error || "unknown reason"),
+        severity: "info",
+        evidence: [{ label: "Queried", value: registrable }],
+      },
+      ageDays: null, registrar: null,
+    };
+  }
+
+  const reg = (data.events || []).find((e) => e.eventAction === "registration")?.eventDate
+  const exp = (data.events || []).find((e) => e.eventAction === "expiration")?.eventDate
+  const upd = (data.events || []).find((e) => e.eventAction === "last changed")?.eventDate
+  const ageDays = reg ? daysBetween(reg) : null
+  const regEntity = (data.entities || []).find((e) => (e.roles || []).includes("registrar"))
+  const registrar = regEntity ? registrarName(regEntity) : null
+  const nsList = (data.nameservers || []).map((n) => (n.ldhName || "").toLowerCase()).filter(Boolean)
+  const statusList = data.status || []
+  const dnssec = data.secureDNS?.delegationSigned
+
+  const evidence: EvidenceRow[] = []
+  const flags: string[] = []
+
+  if (reg) {
+    const ageLabel = ageDays === null ? "unknown" : ageDays + " days old"
+    evidence.push({ label: "Registered", value: reg.slice(0, 10) + " (" + ageLabel + ")", bad: ageDays !== null && ageDays < 30 })
+    if (ageDays !== null && ageDays < 30) flags.push("young-domain")
+    else if (ageDays !== null && ageDays < 180) flags.push("recent-domain")
+  }
+  if (exp) evidence.push({ label: "Expires", value: exp.slice(0, 10) })
+  if (upd) evidence.push({ label: "Last changed", value: upd.slice(0, 10) })
+  if (registrar) evidence.push({ label: "Registrar", value: registrar })
+  if (nsList.length) evidence.push({ label: "Nameservers", value: nsList.join(", ") })
+  if (statusList.length) evidence.push({ label: "Status codes", value: statusList.join(", ") })
+  evidence.push({ label: "DNSSEC", value: dnssec ? "signed" : "not signed", bad: !dnssec })
+
+  let severity: ScamFinding["severity"] = "info"
+  if (flags.includes("young-domain")) severity = "critical"
+  else if (flags.includes("recent-domain")) severity = "medium"
+
+  const summary = flags.includes("young-domain")
+    ? "Domain registered " + (ageDays ?? 0) + " days ago — extremely young."
+    : flags.includes("recent-domain")
+      ? "Domain is under six months old."
+      : "Registration records retrieved. Domain is well-established."
+
+  return {
+    finding: { id: "whois", kind: "whois", title: "Registration (RDAP)", summary, severity, evidence },
+    ageDays, registrar,
+  };
+}

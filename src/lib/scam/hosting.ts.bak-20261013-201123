@@ -1,0 +1,133 @@
+import type { ScamFinding, EvidenceRow } from "./types";
+import { BULLETPROOF_ASNS } from "./threats";
+
+const TIMEOUT_MS = 6_000;
+
+export interface HostingInfo {
+  ip: string;
+  asn: string;
+  org: string;
+  isp: string;
+  country: string;
+  countryCode: string;
+  city: string;
+  isCloudflare: boolean;
+  isDatacenter: boolean;
+  reverse: string | null;
+}
+
+interface IpWhoIs {
+  success?: boolean;
+  ip?: string;
+  type?: string;
+  city?: string;
+  country?: string;
+  country_code?: string;
+  connection?: { asn?: number; org?: string; isp?: string; domain?: string };
+  security?: { is_cloudflare?: boolean; is_datacenter?: boolean; is_proxy?: boolean };
+}
+
+async function lookupIp(ip: string): Promise<IpWhoIs | null> {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), TIMEOUT_MS);
+  try {
+    const r = await fetch("https://ipwho.is/" + encodeURIComponent(ip), {
+      signal: ctrl.signal, cache: "no-store",
+    });
+    if (!r.ok) return null;
+    return (await r.json()) as IpWhoIs;
+  } catch { return null; }
+  finally { clearTimeout(t); }
+}
+
+export async function analyzeHosting(aRecords: string[]): Promise<{ finding: ScamFinding; info: HostingInfo | null }> {
+  if (!aRecords.length) {
+    return {
+      info: null,
+      finding: {
+        id: "hosting", kind: "hosting",
+        title: "Hosting infrastructure",
+        summary: "No A record available \u2014 hosting lookup skipped.",
+        severity: "info",
+      },
+    };
+  }
+  const ip = aRecords[0];
+  const data = await lookupIp(ip);
+  if (!data || !data.success) {
+    return {
+      info: null,
+      finding: {
+        id: "hosting", kind: "hosting",
+        title: "Hosting infrastructure",
+        summary: "IP lookup failed or returned no data.",
+        severity: "info",
+        evidence: [{ label: "IP", value: ip }],
+      },
+    };
+  }
+
+  const asnRaw = data.connection?.asn
+  const asn = asnRaw ? "AS" + asnRaw : "unknown";
+  const org = data.connection?.org || "unknown";
+  const isp = data.connection?.isp || "unknown";
+  const country = data.country || "unknown";
+  const countryCode = data.country_code || "";
+  const city = data.city || "";
+  const isCloudflare = !!data.security?.is_cloudflare;
+  const isDatacenter = !!data.security?.is_datacenter;
+  const reverse = null;
+
+  const evidence: EvidenceRow[] = [
+    { label: "IP", value: ip },
+    { label: "ASN", value: asn },
+    { label: "Organization", value: org },
+    { label: "ISP", value: isp },
+    { label: "Country", value: country + (city ? " \u00b7 " + city : "") },
+  ];
+  const flags: string[] = [];
+
+  if (isCloudflare) {
+    evidence.push({ label: "Fronting", value: "behind Cloudflare \u2014 origin server hidden", bad: true });
+    flags.push("cloudflare");
+  }
+  if (isDatacenter && !isCloudflare) {
+    evidence.push({ label: "Type", value: "datacenter / hosting provider", bad: false });
+    flags.push("datacenter");
+  }
+  const bp = BULLETPROOF_ASNS[asn];
+  if (bp) {
+    evidence.push({ label: "ASN reputation", value: bp + " \u2014 known abuse-friendly host", bad: true });
+    flags.push("bulletproof");
+  }
+  const orgLower = org.toLowerCase();
+  if (["reg.ru","stark industries","ip volume","goproxy","abuse"].some((t) => orgLower.includes(t))) {
+    evidence.push({ label: "Provider reputation", value: "associated with abuse-heavy hosting", bad: true });
+    flags.push("abuse-provider");
+  }
+
+  let severity: ScamFinding["severity"] = "info"
+  if (flags.includes("bulletproof")) severity = "critical"
+  else if (flags.includes("cloudflare")) severity = "medium"   // Cloudflare alone is common; low signal
+  else if (flags.length) severity = "low"
+
+  const summary = flags.includes("bulletproof")
+    ? "Hosted on ASN " + asn + ", which has a documented history of abuse tolerance."
+    : flags.includes("cloudflare")
+      ? "Origin IP is proxied through Cloudflare; the real host is hidden from passive observers."
+      : "Hosting provider is a mainstream datacenter or cloud.";
+
+  const info: HostingInfo = {
+    ip, asn, org, isp, country, countryCode, city,
+    isCloudflare, isDatacenter, reverse,
+  };
+
+  return {
+    info,
+    finding: {
+      id: "hosting", kind: "hosting",
+      title: "Hosting infrastructure",
+      summary, severity, evidence,
+    },
+  };
+}

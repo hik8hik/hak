@@ -1,0 +1,198 @@
+import type { EvidenceRow, ScamFinding } from "./types";
+
+const SB_KEY = process.env.GOOGLE_SAFE_BROWSING_KEY || "";
+const VT_KEY = process.env.VIRUSTOTAL_API_KEY || "";
+const PT_KEY = process.env.PHISHTANK_API_KEY || "";
+
+async function withTimeout<T>(p: (signal: AbortSignal) => Promise<T>, ms: number): Promise<T | null> {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), ms);
+  try { return await p(ctrl.signal); }
+  catch { return null; }
+  finally { clearTimeout(t); }
+}
+
+interface SbMatch { threatType: string; platformType: string; }
+async function safeBrowsing(url: string): Promise<ScamFinding> {
+  if (!SB_KEY) {
+    return { id: "rep-sb", kind: "reputation", title: "Google Safe Browsing",
+      summary: "Not configured. Set GOOGLE_SAFE_BROWSING_KEY to enable.", severity: "info" };
+  }
+  const body = {
+    client: { clientId: "hak", clientVersion: "1.0" },
+    threatInfo: {
+      threatTypes: ["MALWARE","SOCIAL_ENGINEERING","UNWANTED_SOFTWARE","POTENTIALLY_HARMFUL_APPLICATION"],
+      platformTypes: ["ANY_PLATFORM"],
+      threatEntryTypes: ["URL"],
+      threatEntries: [{ url }],
+    },
+  };
+  const res = await withTimeout(async (signal) => {
+    const r = await fetch("https://safebrowsing.googleapis.com/v4/threatMatches:find?key=" + SB_KEY, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body), signal, cache: "no-store",
+    });
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    return (await r.json()) as { matches?: SbMatch[] };
+  }, 8000);
+  if (!res) return { id: "rep-sb", kind: "reputation", title: "Google Safe Browsing", summary: "Lookup failed or timed out.", severity: "info" };
+  const matches = res.matches || [];
+  if (!matches.length) {
+    return { id: "rep-sb", kind: "reputation", title: "Google Safe Browsing", summary: "No match in Google threat lists.", severity: "info" };
+  }
+  const types = matches.map((m) => m.threatType).join(", ");
+  return { id: "rep-sb", kind: "reputation", title: "Google Safe Browsing",
+    summary: "Flagged by Google Safe Browsing: " + types, severity: "critical",
+    evidence: [{ label: "Threat types", value: types, bad: true }] };
+}
+
+function vtId(url: string): string {
+  return Buffer.from(url).toString("base64").replace(/=+$/, "").replace(/\+/g, "-").replace(/\//g, "_");
+}
+async function virusTotal(url: string): Promise<ScamFinding> {
+  if (!VT_KEY) {
+    return { id: "rep-vt", kind: "reputation", title: "VirusTotal",
+      summary: "Not configured. Set VIRUSTOTAL_API_KEY to enable.", severity: "info" };
+  }
+  const res = await withTimeout(async (signal) => {
+    const r = await fetch("https://www.virustotal.com/api/v3/urls/" + vtId(url), {
+      headers: { "x-apikey": VT_KEY }, signal, cache: "no-store",
+    });
+    if (r.status === 404) return { notFound: true } as const;
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    return (await r.json()) as any;
+  }, 10000);
+  if (!res) return { id: "rep-vt", kind: "reputation", title: "VirusTotal", summary: "Lookup failed or timed out.", severity: "info" };
+  if ("notFound" in res && res.notFound) {
+    return { id: "rep-vt", kind: "reputation", title: "VirusTotal", summary: "URL not previously submitted.", severity: "info" };
+  }
+  const stats = res?.data?.attributes?.last_analysis_stats || {};
+  const malicious = Number(stats.malicious || 0);
+  const suspicious = Number(stats.suspicious || 0);
+  const harmless = Number(stats.harmless || 0);
+  const undetected = Number(stats.undetected || 0);
+  const total = malicious + suspicious + harmless + undetected;
+  const cats: Record<string, string> = res?.data?.attributes?.categories || {};
+  const catList = Object.values(cats).slice(0, 6);
+  const reputation = Number(res?.data?.attributes?.reputation || 0);
+  const evidence: EvidenceRow[] = [
+    { label: "Engines total", value: String(total) },
+    { label: "Malicious", value: String(malicious), bad: malicious > 0 },
+    { label: "Suspicious", value: String(suspicious), bad: suspicious > 0 },
+    { label: "Harmless", value: String(harmless) },
+    { label: "Undetected", value: String(undetected) },
+    { label: "Community reputation", value: String(reputation) },
+  ];
+  if (catList.length) evidence.push({ label: "Categories", value: catList.join(", ") });
+  let severity: ScamFinding["severity"] = "info";
+  if (malicious >= 5) severity = "critical";
+  else if (malicious > 0) severity = "high";
+  else if (suspicious > 0) severity = "medium";
+  const summary = malicious > 0
+    ? malicious + "/" + total + " engines flagged this URL as malicious."
+    : suspicious > 0
+      ? suspicious + "/" + total + " engines flagged this URL as suspicious."
+      : "No engine has flagged this URL.";
+  return { id: "rep-vt", kind: "reputation", title: "VirusTotal", summary, severity, evidence };
+}
+
+async function phishTank(url: string): Promise<ScamFinding> {
+  if (!PT_KEY) {
+    return { id: "rep-pt", kind: "reputation", title: "PhishTank",
+      summary: "Not configured. Set PHISHTANK_API_KEY to enable.", severity: "info" };
+  }
+  const res = await withTimeout(async (signal) => {
+    const r = await fetch("https://checkurl.phishtank.com/checkurl/", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: "url=" + encodeURIComponent(url) + "&format=json&app_key=" + PT_KEY,
+      signal, cache: "no-store",
+    });
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    return (await r.json()) as any;
+  }, 8000);
+  if (!res) return { id: "rep-pt", kind: "reputation", title: "PhishTank", summary: "Lookup failed or timed out.", severity: "info" };
+  const inDb = res?.results?.in_database;
+  const verified = res?.results?.verified;
+  const valid = res?.results?.valid;
+  if (!inDb) {
+    return { id: "rep-pt", kind: "reputation", title: "PhishTank", summary: "URL not in PhishTank database.", severity: "info" };
+  }
+  const evidence: EvidenceRow[] = [
+    { label: "In database", value: String(inDb) },
+    { label: "Verified phishing", value: String(!!verified), bad: !!verified },
+    { label: "Currently valid", value: String(!!valid) },
+  ];
+  if (verified) {
+    return { id: "rep-pt", kind: "reputation", title: "PhishTank",
+      summary: "Verified as phishing in the PhishTank database.", severity: "critical", evidence };
+  }
+  return { id: "rep-pt", kind: "reputation", title: "PhishTank",
+    summary: "Present in PhishTank but not verified.", severity: "medium", evidence };
+}
+
+async function urlhaus(host: string): Promise<ScamFinding> {
+  const res = await withTimeout(async (signal) => {
+    const r = await fetch("https://urlhaus-api.abuse.ch/v1/host/", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: "host=" + encodeURIComponent(host), signal, cache: "no-store",
+    });
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    return (await r.json()) as any;
+  }, 8000);
+  if (!res) return { id: "rep-uh", kind: "reputation", title: "URLhaus (abuse.ch)", summary: "Lookup failed or timed out.", severity: "info" };
+  if (res.query_status !== "ok") {
+    return { id: "rep-uh", kind: "reputation", title: "URLhaus (abuse.ch)", summary: "Host not in URLhaus malware database.", severity: "info" };
+  }
+  const urls: any[] = res.urls || [];
+  const firstSeen = urls[urls.length - 1]?.date_added || null;
+  const tags: string[] = [];
+  for (const u of urls) if (u.tags) tags.push(...u.tags);
+  const uniqTags = Array.from(new Set(tags)).slice(0, 8);
+  const evidence: EvidenceRow[] = [{ label: "URLs seen", value: String(urls.length), bad: true }];
+  if (firstSeen) evidence.push({ label: "First seen", value: firstSeen });
+  if (uniqTags.length) evidence.push({ label: "Family tags", value: uniqTags.join(", "), bad: true });
+  return { id: "rep-uh", kind: "reputation", title: "URLhaus (abuse.ch)",
+    summary: "Host is distributing malware — " + urls.length + " known URL(s).",
+    severity: "critical", evidence };
+}
+
+let openPhishCache: { at: number; set: Set<string> } | null = null;
+async function getOpenPhish(): Promise<Set<string>> {
+  if (openPhishCache && Date.now() - openPhishCache.at < 15 * 60 * 1000) return openPhishCache.set;
+  try {
+    const r = await fetch("https://openphish.com/feed.txt", { next: { revalidate: 900 } } as any);
+    if (!r.ok) return new Set();
+    const text = await r.text();
+    const set = new Set(text.split("\n").map((l) => l.trim()).filter(Boolean));
+    openPhishCache = { at: Date.now(), set };
+    return set;
+  } catch { return new Set(); }
+}
+async function openPhish(url: string, host: string): Promise<ScamFinding> {
+  const set = await getOpenPhish();
+  if (!set.size) {
+    return { id: "rep-op", kind: "reputation", title: "OpenPhish", summary: "Feed unavailable or empty.", severity: "info" };
+  }
+  const exact = set.has(url);
+  const hostHit = !exact && Array.from(set).some((u) => u.startsWith("http://" + host) || u.startsWith("https://" + host));
+  if (exact) {
+    return { id: "rep-op", kind: "reputation", title: "OpenPhish",
+      summary: "Exact URL match in OpenPhish phishing feed.", severity: "critical",
+      evidence: [{ label: "Match type", value: "exact URL", bad: true }] };
+  }
+  if (hostHit) {
+    return { id: "rep-op", kind: "reputation", title: "OpenPhish",
+      summary: "Host has other URLs in the OpenPhish phishing feed.", severity: "high",
+      evidence: [{ label: "Match type", value: "host-level", bad: true }] };
+  }
+  return { id: "rep-op", kind: "reputation", title: "OpenPhish", summary: "No match in OpenPhish feed.", severity: "info" };
+}
+
+export async function runReputation(url: string, host: string): Promise<ScamFinding[]> {
+  const [sb, vt, pt, uh, op] = await Promise.all([
+    safeBrowsing(url), virusTotal(url), phishTank(url), urlhaus(host), openPhish(url, host),
+  ]);
+  return [sb, vt, pt, uh, op];
+}

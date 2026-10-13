@@ -1,0 +1,88 @@
+"use client";
+import { useEffect, useRef, useState } from "react";
+import type { ThreatItem } from "@/lib/types";
+import { severityVar, tacticVar } from "@/lib/colors";
+import { rasterise, download } from "@/lib/export";
+import { PRESETS } from "@/lib/types";
+import { toMarkdown } from "@/lib/markdown";
+import { useQueue } from "@/context/QueueContext";
+import { useSettings } from "@/context/SettingsContext";
+
+export default function ThreatCard({ item, exportable = false }: { item: ThreatItem; exportable?: boolean }) {
+  const ref = useRef<HTMLDivElement>(null);
+  const [epss, setEpss] = useState<{ p: number; pct: number } | null>(null);
+  const sevColor = severityVar(item.severity);
+  const { has, toggle } = useQueue();
+  const { s } = useSettings();
+
+  useEffect(() => {
+    if (item.kind !== "cve" && item.kind !== "kev") return;
+    let cancelled = false;
+    fetch(`/api/epss?cve=${encodeURIComponent(item.id)}`)
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d) => { if (!cancelled && d) setEpss(d); })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, [item.id, item.kind]);
+
+  async function exportPreset(id: string) {
+    const p = PRESETS.find((x) => x.id === id);
+    if (!p || !ref.current) return;
+    const url = await rasterise(ref.current, { width: p.w, height: p.h, pixelRatio: p.pr });
+    download(url, `${item.id}-${p.id}.png`);
+  }
+  async function exportFast(pr: number) {
+    if (!ref.current) return;
+    const url = await rasterise(ref.current, { width: ref.current.offsetWidth, height: ref.current.offsetHeight, pixelRatio: pr });
+    download(url, `${item.id}-${pr}x.png`);
+  }
+  async function copyMd() {
+    await navigator.clipboard.writeText(toMarkdown(item));
+  }
+
+  return (
+    <div className="card raised" ref={ref} style={s.accentColor ? { borderTop: `2px solid ${s.accentColor}` } : undefined}>
+      <div className="card-head">
+        <span className="card-id mono">{item.id}</span>
+        <span className="pill" style={{ color: sevColor }}>
+          <span className="dot" style={{ background: sevColor }} />
+          {item.severity ?? "none"}
+        </span>
+        {epss && (
+          <span className="pill" title="EPSS: probability of exploitation in next 30d">
+            EPSS {(epss.p * 100).toFixed(1)}%
+          </span>
+        )}
+      </div>
+      <h3>{item.title}</h3>
+      <p>{item.summary}</p>
+      {item.tactics && item.tactics.length > 0 && (
+        <div className="tactics">
+          {item.tactics.map((t) => (
+            <span key={t} className="pill" style={{ color: tacticVar(t) }}>
+              <span className="dot" style={{ background: tacticVar(t) }} />{t}
+            </span>
+          ))}
+        </div>
+      )}
+      {exportable && (
+        <div className="card-actions">
+          <button className="star" data-on={has(item.id)} onClick={() => toggle(item)} title="Add to export queue">★</button>
+          <button className="btn small" onClick={copyMd} title="Copy as Markdown">MD</button>
+          <button className="btn small" onClick={() => exportFast(4)}>4x</button>
+          <button className="btn small" onClick={() => exportFast(8)}>8x</button>
+          <div className="seg">
+            {PRESETS.map((p) => (
+              <button key={p.id} onClick={() => exportPreset(p.id)}>{p.label}</button>
+            ))}
+          </div>
+        </div>
+      )}
+      {s.watermark && (
+        <div className="small muted" style={{ marginTop: 6, textAlign: "right" }}>
+          {s.watermarkText || "hak"}
+        </div>
+      )}
+    </div>
+  );
+}

@@ -1,0 +1,52 @@
+"use client";
+import JSZip from "jszip";
+import { useQueue } from "@/context/QueueContext";
+import { useSettings } from "@/context/SettingsContext";
+import { toMarkdown } from "@/lib/markdown";
+import { buildQueueHtml } from "@/lib/queueRender";
+import { rasterise } from "@/lib/export";
+import { PRESETS } from "@/lib/types";
+
+export default function QueueBar() {
+  const { items, remove, clear } = useQueue();
+  const { s } = useSettings();
+
+  async function exportZip() {
+    const zip = new JSZip();
+    const preset = PRESETS.find((p) => p.id === "post4k") || PRESETS[2];
+    for (const it of items) {
+      const host = document.createElement("div");
+      host.style.cssText = `position:fixed;top:0;left:-200vw;width:${preset.w}px;height:${preset.h}px;`
+      host.innerHTML = buildQueueHtml(it);
+      document.body.appendChild(host);
+      const url = await rasterise(host, { width: preset.w, height: preset.h, pixelRatio: preset.pr });
+      document.body.removeChild(host);
+      zip.file(`${it.id}.png`, url.split(",")[1], { base64: true });
+    }
+    const blob = await zip.generateAsync({ type: "blob" });
+    const a = document.createElement("a")
+    a.href = URL.createObjectURL(blob)
+    a.download = "hak-queue.zip"
+    a.click()
+  }
+  function exportMd() {
+    const md = items.map(toMarkdown).join("\n\n---\n\n")
+    const blob = new Blob([md], { type: "text/markdown" })
+    const a = document.createElement("a")
+    a.href = URL.createObjectURL(blob)
+    a.download = "hak-queue.md"
+    a.click()
+  }
+
+  return (
+    <div className="qbar" data-empty={items.length === 0}>
+      <span className="small"><b>{items.length}</b> in queue</span>
+      <button className="btn small" onClick={exportZip}>Export ZIP</button>
+      <button className="btn small" onClick={exportMd}>Export MD</button>
+      <button className="btn small" onClick={clear}>Clear</button>
+      <span className="small muted" title={items.map((i) => i.id).join(", ")}>
+        {items.slice(0, 3).map((i) => i.id).join(" · ")}{items.length > 3 ? " …" : ""}
+      </span>
+    </div>
+  );
+}

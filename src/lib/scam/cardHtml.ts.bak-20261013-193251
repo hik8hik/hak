@@ -1,0 +1,101 @@
+import type { ExportPreset } from "@/lib/types";
+import type { ScamFinding, ScamSeverity } from "./types";
+
+const UI_FONT = "system-ui,-apple-system,BlinkMacSystemFont,Roboto,Helvetica,Arial,sans-serif";
+const MONO_FONT = "ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace";
+
+const SEV_COLOR: Record<ScamSeverity, string> = {
+  critical: "#DD0008",
+  high: "#FF7E1E",
+  medium: "#FFC107",
+  low: "#4ECB4A",
+  info: "#8892a6",
+};
+
+function esc(s: string): string {
+  return String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c] as string));
+}
+
+function truncate(s: string, n: number): string {
+  return s.length > n ? s.slice(0, n - 1) + "\u2026" : s;
+}
+
+function attr(name: string, value: string | number): string {
+  return " " + name + "=\"" + String(value).replace(/"/g, "&quot;") + "\"";
+}
+
+function styleAttr(css: string): string {
+  return " style=\"" + css.replace(/"/g, "&quot;") + "\"";
+}
+
+export function scamFindingHtml(f: ScamFinding, preset: ExportPreset, host: string): string {
+  const W = preset.w;
+  const H = preset.h;
+  const isLandscape = W > H;
+  const ref = Math.min(W, H);
+
+  const pad = Math.round(ref * 0.075)
+  const idSize = Math.round(ref * 0.020)
+  const pillSize = Math.round(ref * 0.017)
+  const titleSize = Math.round(ref * (isLandscape ? 0.048 : 0.058))
+  const summarySize = Math.round(ref * 0.026)
+  const evLabelSize = Math.round(ref * 0.018)
+  const evValueSize = Math.round(ref * 0.020)
+  const brandSize = Math.round(ref * 0.013)
+  const sev = SEV_COLOR[f.severity]
+  const maxEvidence = isLandscape ? 6 : (H >= 1900 ? 12 : 8)
+  const rows = (f.evidence || []).slice(0, maxEvidence)
+
+  const rootCss = [
+    "width:" + W + "px",
+    "height:" + H + "px",
+    "box-sizing:border-box",
+    "padding:" + pad + "px",
+    "display:flex",
+    "flex-direction:column",
+    "background:var(--surface)",
+    "color:var(--text)",
+    "font-family:" + UI_FONT,
+    "overflow:hidden",
+    "border-top:8px solid " + sev,
+  ].join(";")
+
+  const headerCss = "display:flex;align-items:center;gap:" + Math.round(pad * 0.25) + "px;flex-wrap:wrap;"
+  const idCss = "font-family:" + MONO_FONT + ";font-size:" + idSize + "px;letter-spacing:0.04em;color:var(--text-dim);text-transform:uppercase;"
+  const kindCss = "padding:" + Math.round(pillSize * 0.35) + "px " + Math.round(pillSize * 0.85) + "px;border-radius:999px;background:var(--surface-2);color:var(--text-dim);font-size:" + pillSize + "px;font-weight:600;letter-spacing:0.05em;text-transform:uppercase;"
+  const sevCss = "display:inline-flex;align-items:center;gap:6px;padding:" + Math.round(pillSize * 0.35) + "px " + Math.round(pillSize * 0.85) + "px;border-radius:999px;background:" + sev + ";color:#fff;font-size:" + pillSize + "px;font-weight:700;letter-spacing:0.05em;text-transform:uppercase;"
+  const titleCss = "margin:" + Math.round(pad * 0.35) + "px 0 " + Math.round(pad * 0.20) + "px;font-size:" + titleSize + "px;line-height:1.18;letter-spacing:-0.01em;font-weight:800;"
+  const summaryCss = "margin:0 0 " + Math.round(pad * 0.30) + "px;font-size:" + summarySize + "px;line-height:1.45;color:var(--text-dim);"
+  const evRowCss = "display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.35fr);gap:" + Math.round(pad * 0.20) + "px;padding:" + Math.round(pad * 0.12) + "px " + Math.round(pad * 0.18) + "px;border-radius:8px;background:var(--surface-2);margin-bottom:4px;font-size:" + evValueSize + "px;line-height:1.4;"
+  const evRowBadCss = evRowCss + "border-left:3px solid " + sev + ";"
+  const evLabelCss = "font-size:" + evLabelSize + "px;color:var(--text-dim);text-transform:uppercase;letter-spacing:0.05em;font-weight:600;"
+  const evValueCss = "font-size:" + evValueSize + "px;word-break:break-word;"
+  const footCss = "display:flex;align-items:flex-end;justify-content:space-between;gap:" + Math.round(pad * 0.5) + "px;margin-top:auto;padding-top:" + Math.round(pad * 0.30) + "px;"
+  const brandCss = "font-size:" + brandSize + "px;color:var(--text-dim);letter-spacing:0.03em;"
+  const hostCss = "font-family:" + MONO_FONT + ";font-size:" + brandSize + "px;color:var(--text-dim);letter-spacing:0.02em;max-width:60%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;"
+
+  const evidenceHtml = rows.length
+    ? rows.map((r) => {
+        const css = r.bad ? evRowBadCss : evRowCss
+        return "<div" + styleAttr(css) + ">" +
+          "<div" + styleAttr(evLabelCss) + ">" + esc(r.label) + "</div>" +
+          "<div" + styleAttr(evValueCss) + ">" + esc(truncate(r.value, 220)) + "</div>" +
+        "</div>"
+      }).join("")
+    : ""
+
+  return "<div" + styleAttr(rootCss) + ">" +
+    "<div" + styleAttr(headerCss) + ">" +
+      "<span" + styleAttr(idCss) + ">" + esc(f.id) + "</span>" +
+      "<span" + styleAttr(kindCss) + ">" + esc(f.kind) + "</span>" +
+      "<span" + styleAttr(sevCss) + ">" + esc(f.severity) + "</span>" +
+    "</div>" +
+    "<h1" + styleAttr(titleCss) + ">" + esc(f.title) + "</h1>" +
+    "<p" + styleAttr(summaryCss) + ">" + esc(truncate(f.summary, 420)) + "</p>" +
+    evidenceHtml +
+    "<div" + styleAttr(footCss) + ">" +
+      "<div" + styleAttr(brandCss) + ">hak · scam scanner</div>" +
+      "<div" + styleAttr(hostCss) + ">" + esc(host) + "</div>" +
+    "</div>" +
+  "</div>";
+}

@@ -1,0 +1,105 @@
+import type { ScamFinding, EvidenceRow } from "./types";
+
+const TIMEOUT_MS = 7_000;
+
+export interface NewsHit {
+  title: string;
+  link: string;
+  pubDate: string;
+  source: string;
+}
+
+function decodeEntities(s: string): string {
+  return s
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, "$1");
+}
+
+function extractItems(xml: string, max = 6): NewsHit[] {
+  const out: NewsHit[] = [];
+  const itemRe = /<item>([\s\S]*?)<\/item>/gi;
+  let m: RegExpExecArray | null;
+  while ((m = itemRe.exec(xml)) !== null && out.length < max) {
+    const body = m[1];
+    const title = decodeEntities(body.match(/<title[^>]*>([\s\S]*?)<\/title>/i)?.[1] || "").trim();
+    const link = body.match(/<link[^>]*>([\s\S]*?)<\/link>/i)?.[1]?.trim() || "";
+    const pubDate = body.match(/<pubDate[^>]*>([\s\S]*?)<\/pubDate>/i)?.[1]?.trim() || "";
+    const source = decodeEntities(body.match(/<source[^>]*>([\s\S]*?)<\/source>/i)?.[1] || "").trim();
+    if (title && link) out.push({ title, link, pubDate, source });
+  }
+  return out;
+}
+
+async function searchNews(query: string): Promise<NewsHit[]> {
+  const url = "https://news.google.com/rss/search?q=" + encodeURIComponent(query) + "&hl=en-KE&gl=KE&ceid=KE:en";
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), TIMEOUT_MS);
+  try {
+    const r = await fetch(url, {
+      signal: ctrl.signal,
+      cache: "no-store",
+      headers: { "User-Agent": "Mozilla/5.0 (compatible; hak-scam/1.0)" },
+    });
+    if (!r.ok) return [];
+    const xml = await r.text();
+    return extractItems(xml);
+  } catch { return []; }
+  finally { clearTimeout(t); }
+}
+
+const SCAM_KEYWORDS = "scam OR warning OR fraud OR phishing OR fake OR disavow";
+
+export async function analyzeNews(
+  registrableDomain: string,
+  brandMentions: string[],
+): Promise<{ finding: ScamFinding; hits: NewsHit[] }> {
+  // Two searches: the domain itself, and the top mentioned brand + scam keywords.
+  const queries: string[] = [];
+  if (registrableDomain) queries.push(registrableDomain + " " + SCAM_KEYWORDS);
+  const uniqueBrands = Array.from(new Set(brandMentions)).slice(0, 2);
+  for (const b of uniqueBrands) {
+    queries.push(b + " scam warning Kenya");
+  }
+
+  const allHits: NewsHit[] = [];
+  const seen = new Set<string>();
+  for (const q of queries) {
+    const hits = await searchNews(q);
+    for (const h of hits) {
+      if (seen.has(h.link)) continue;
+      seen.add(h.link);
+      allHits.push(h);
+    }
+  }
+
+  const evidence: EvidenceRow[] = [];
+  const flags: string[] = [];
+
+  if (allHits.length) {
+    const top = allHits.slice(0, 5);
+    for (const h of top) {
+      evidence.push({ label: h.source || "News", value: h.title, bad: true });
+    }
+    flags.push("news-hits");
+  }
+
+  const summary = allHits.length
+    ? allHits.length + " news item(s) reference this domain or the brand it mentions in a scam/warning context."
+    : "No scam-related news found for the domain or its brands in the last search window.";
+
+  const severity: ScamFinding["severity"] = allHits.length ? "critical" : "info";
+
+  return {
+    hits: allHits,
+    finding: {
+      id: "news", kind: "news",
+      title: "News & regulatory signals",
+      summary, severity, evidence,
+      references: allHits.slice(0, 5).map((h) => h.link),
+    },
+  };
+}

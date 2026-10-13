@@ -1,0 +1,339 @@
+"use client";
+import { useMemo, useState } from "react";
+import JSZip from "jszip";
+import type { ScanReport, ScamFinding } from "@/lib/scam/types";
+import { scamFindingHtml, scamNarrativeHtml, scamCoverHtml, type CoverFinding } from "@/lib/scam/cardHtml";
+import { rasteriseHtml, surfaceColor, download } from "@/lib/export";
+import { PRESETS, type ExportPreset } from "@/lib/types";
+import ScamFindingCard from "./ScamFindingCard";
+
+const SAMPLES = [
+  "ziiditraders.online",
+  "paypa1-secure-login.xyz/verify",
+  "signin-appleid.com-verify.top/account",
+  "microsoft-office365-auth.duckdns.org/login",
+  "example.com",
+];
+
+function pixelSize(p: ExportPreset) {
+  return p.w * p.pr + "\u00d7" + p.h * p.pr;
+}
+function pixelTag(p: ExportPreset) {
+  return p.w * p.pr + "x" + p.h * p.pr;
+}
+
+const KIND_LABEL: Record<string, string> = {
+  verdict: "Verdict",
+  narrative: "Narrative",
+  lexical: "Lexical",
+  whois: "RDAP / WHOIS",
+  dns: "DNS",
+  tls: "TLS",
+  reputation: "Reputation",
+  hosting: "Hosting",
+  html: "Page content",
+  jsbundles: "JavaScript bundles",
+  news: "News & warnings",
+  impersonation: "Impersonation",
+  host: "Host",
+};
+
+function coverFindings(report: ScanReport): CoverFinding[] {
+  // Feed every finding (except verdict/narrative) into the cover preview.
+  const out: CoverFinding[] = []
+  for (const f of report.findings) {
+    if (f.kind === "verdict" || f.kind === "narrative") continue
+    out.push({ severity: f.severity, title: f.title, summary: f.summary })
+  }
+  return out
+}
+
+function renderCover(report: ScanReport, preset: ExportPreset): string {
+  const scanned = new Date(report.scannedAt).toLocaleString()
+  return scamCoverHtml(
+    report.normalizedUrl,
+    report.hostname,
+    report.score,
+    report.verdictSeverity,
+    report.verdict,
+    report.narrative || "",
+    coverFindings(report),
+    scanned,
+    preset,
+  )
+}
+
+export default function ScamScanner() {
+  const [url, setUrl] = useState("")
+  const [report, setReport] = useState<ScanReport | null>(null)
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const [presetId, setPresetId] = useState("post4k")
+  const [exportBusy, setExportBusy] = useState(false)
+  const [exportProgress, setExportProgress] = useState(0)
+
+  const preset = PRESETS.find((p) => p.id === presetId) || PRESETS[2]
+
+  const grouped = useMemo(() => {
+    if (!report) return [] as ScamFinding[]
+    return report.findings
+  }, [report])
+
+  async function scan(target?: string) {
+    const q = (target ?? url).trim()
+    if (!q) return
+    setBusy(true); setError(null); setReport(null)
+    try {
+      const r = await fetch("/api/scam", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ url: q }),
+      })
+      if (!r.ok) {
+        const t = await r.text()
+        throw new Error("HTTP " + r.status + ": " + t.slice(0, 200))
+      }
+      const data = (await r.json()) as ScanReport
+      setReport(data)
+    } catch (e) {
+      setError(String(e))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function exportCover() {
+    if (!report) return
+    const html = renderCover(report, preset)
+    const url = await rasteriseHtml(html, {
+      width: preset.w, height: preset.h, pixelRatio: preset.pr, background: surfaceColor(),
+    })
+    const safe = report.registrableDomain.replace(/[^a-z0-9.-]/gi, "_")
+    download(url, "hak-scam-cover-" + safe + "-" + pixelTag(preset) + ".png")
+  }
+
+  async function exportFinding(findingId: string) {
+    if (!report) return
+    const f = report.findings.find((x) => x.id === findingId)
+    if (!f) return
+    const html = f.kind === "narrative"
+      ? scamNarrativeHtml(report.narrative || f.summary, report.normalizedUrl, report.score, report.verdictSeverity, preset)
+      : scamFindingHtml(f, preset, report.hostname)
+    const url = await rasteriseHtml(html, {
+      width: preset.w, height: preset.h, pixelRatio: preset.pr, background: surfaceColor(),
+    })
+    const safe = findingId.replace(/[^a-z0-9_-]/gi, "_")
+    download(url, "hak-scam-" + safe + "-" + pixelTag(preset) + ".png")
+  }
+
+  async function exportAllZip() {
+    if (!report || exportBusy) return
+    setExportBusy(true); setExportProgress(0)
+    const zip = new JSZip()
+    const bg = surfaceColor()
+    try {
+      // 1. Cover page — always first, so viewers see the whole story.
+      const coverHtml = renderCover(report, preset)
+      const coverUrl = await rasteriseHtml(coverHtml, {
+        width: preset.w, height: preset.h, pixelRatio: preset.pr, background: bg,
+      })
+      zip.file("00-cover.png", coverUrl.split(",")[1], { base64: true })
+      setExportProgress(1 / (report.findings.length + 1))
+
+      // 2. Every finding.
+      const list = report.findings
+      for (let i = 0; i < list.length; i++) {
+        const f = list[i]
+        const html = f.kind === "narrative"
+          ? scamNarrativeHtml(report.narrative || f.summary, report.normalizedUrl, report.score, report.verdictSeverity, preset)
+          : scamFindingHtml(f, preset, report.hostname)
+        const dataUrl = await rasteriseHtml(html, {
+          width: preset.w, height: preset.h, pixelRatio: preset.pr, background: bg,
+        })
+        const safe = f.id.replace(/[^a-z0-9_-]/gi, "_")
+        const name = String(i + 1).padStart(2, "0") + "-" + safe + ".png"
+        zip.file(name, dataUrl.split(",")[1], { base64: true })
+        setExportProgress((i + 2) / (list.length + 1))
+      }
+
+      // 3. Markdown report.
+      const md = buildMarkdownReport(report)
+      zip.file("report.md", md)
+      const blob = await zip.generateAsync({ type: "blob" })
+      const a = document.createElement("a")
+      a.href = URL.createObjectURL(blob)
+      a.download = "hak-scam-" + report.registrableDomain.replace(/[^a-z0-9.-]/gi, "_") + "-" + pixelTag(preset) + ".zip"
+      document.body.appendChild(a); a.click(); a.remove()
+      setTimeout(() => URL.revokeObjectURL(a.href), 3000)
+    } catch (e) {
+      console.error("[hak/scam] export failed", e)
+      alert("Export failed: " + String(e))
+    } finally {
+      setExportBusy(false); setExportProgress(0)
+    }
+  }
+
+  function copyMarkdown() {
+    if (!report) return
+    void navigator.clipboard.writeText(buildMarkdownReport(report))
+  }
+
+  return (
+    <div>
+      <div className="row" style={{ marginBottom: 12, flexWrap: "wrap" }}>
+        <h2 style={{ margin: 0 }}>Scam scanner</h2>
+        <div className="spacer" />
+        <span className="small muted">URL · RDAP · DNS · TLS · reputation · page · JS · hosting · news</span>
+      </div>
+
+      <div className="pane raised" style={{ display: "flex", flexDirection: "column", gap: 10, padding: 16 }}>
+        <div className="row" style={{ gap: 8 }}>
+          <input
+            className="inset-sm"
+            style={{ flex: 1, padding: "10px 14px", border: 0, outline: "none", fontFamily: "var(--font-mono)", fontSize: 14 }}
+            placeholder="https://suspicious-domain.com/login"
+            value={url}
+            onChange={(e) => setUrl(e.target.value)}
+            onKeyDown={(e) => { if (e.key === "Enter") void scan() }}
+            spellCheck={false}
+          />
+          <button className="btn" onClick={() => scan()} disabled={busy || !url.trim()}>
+            {busy ? "Investigating…" : "Scan"}
+          </button>
+          {report && <button className="btn" onClick={() => { setReport(null); setUrl("") }}>Clear</button>}
+        </div>
+        <div className="row" style={{ flexWrap: "wrap", gap: 6 }}>
+          <span className="small muted">Try:</span>
+          {SAMPLES.map((s) => (
+            <button key={s} className="btn small" onClick={() => { setUrl(s); void scan(s) }} disabled={busy}>
+              {s}
+            </button>
+          ))}
+        </div>
+        <p className="small muted" style={{ margin: 0 }}>
+          Nothing on the target page is executed in your browser. All network activity is server-side.
+          Findings reflect what could be verified in the layers reachable from this host.
+        </p>
+      </div>
+
+      {error && (
+        <div className="pane raised" style={{ padding: 16, marginTop: 16, borderLeft: "4px solid var(--cs-critical)" }}>
+          <strong>Scan failed</strong>
+          <p className="small muted" style={{ margin: "6px 0 0" }}>{error}</p>
+        </div>
+      )}
+
+      {report && (
+        <>
+          <div className="pane raised" style={{ padding: 18, marginTop: 18 }}>
+            <div className="row" style={{ alignItems: "flex-start", gap: 18, flexWrap: "wrap" }}>
+              <div style={{ flex: "0 0 140px", textAlign: "center" }}>
+                <div style={{ fontSize: 56, fontWeight: 800, lineHeight: 1, color: severityColor(report.verdictSeverity) }}>
+                  {report.score}
+                </div>
+                <div className="small muted">risk score / 100</div>
+              </div>
+              <div style={{ flex: 1, minWidth: 240 }}>
+                <div className="small muted mono" style={{ wordBreak: "break-all" }}>{report.normalizedUrl}</div>
+                <h3 style={{ margin: "6px 0", color: severityColor(report.verdictSeverity) }}>
+                  {report.verdictSeverity.toUpperCase()}
+                </h3>
+                <p style={{ margin: 0 }}>{report.verdict}</p>
+                <div className="small muted" style={{ marginTop: 8 }}>
+                  {report.findings.length} findings · scanned in {report.durationMs} ms · 
+                  {new Date(report.scannedAt).toLocaleString()}
+                </div>
+              </div>
+            </div>
+
+            <div className="row" style={{ marginTop: 14, flexWrap: "wrap", gap: 8 }}>
+              <div className="seg">
+                {PRESETS.map((p) => (
+                  <button key={p.id} data-active={presetId === p.id} onClick={() => setPresetId(p.id)} disabled={exportBusy}>
+                    {p.label}
+                  </button>
+                ))}
+              </div>
+              <button className="btn" onClick={exportCover} disabled={exportBusy} style={{ background: "var(--accent)", color: "#fff" }}>
+                Export cover
+              </button>
+              <button className="btn" onClick={exportAllZip} disabled={exportBusy}>
+                {exportBusy ? "Exporting " + Math.round(exportProgress * 100) + "%" : "Export all → ZIP (" + pixelSize(preset) + ")"}
+              </button>
+              <button className="btn" onClick={copyMarkdown} disabled={exportBusy}>Copy Markdown</button>
+            </div>
+            <p className="small muted" style={{ margin: "8px 0 0" }}>
+              The ZIP starts with <code>00-cover.png</code> — the full executive summary on one card. Findings follow as 01, 02, ...
+            </p>
+          </div>
+
+          <div className="feed" style={{ marginTop: 18 }}>
+            {grouped.map((f) => (
+              <ScamFindingCard key={f.id} finding={f} />
+            ))}
+          </div>
+
+          <div className="pane raised" style={{ marginTop: 18, padding: 14 }}>
+            <div className="row" style={{ flexWrap: "wrap", gap: 8 }}>
+              <span className="small muted">Export each card:</span>
+              <button className="btn small" onClick={exportCover} disabled={exportBusy} style={{ background: "var(--accent)", color: "#fff" }}>
+                Cover
+              </button>
+              {report.findings.map((f) => (
+                <button key={f.id} className="btn small" onClick={() => exportFinding(f.id)} disabled={exportBusy}>
+                  {KIND_LABEL[f.kind] || f.id}
+                </button>
+              ))}
+            </div>
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+function severityColor(sev: string): string {
+  if (sev === "critical") return "var(--cs-critical)"
+  if (sev === "high") return "var(--cs-high)"
+  if (sev === "medium") return "var(--cs-medium)"
+  if (sev === "low") return "var(--cs-low)"
+  return "var(--text-dim)"
+}
+
+function buildMarkdownReport(r: ScanReport): string {
+  const lines: string[] = []
+  lines.push("# Scam scan — " + r.normalizedUrl)
+  lines.push("")
+  lines.push("- **Risk score:** " + r.score + "/100")
+  lines.push("- **Verdict:** " + r.verdictSeverity.toUpperCase())
+  lines.push("- **Hostname:** `" + r.hostname + "`")
+  lines.push("- **Registrable domain:** `" + r.registrableDomain + "`")
+  lines.push("- **Scanned:** " + r.scannedAt)
+  lines.push("- **Duration:** " + r.durationMs + " ms")
+  lines.push("")
+  if (r.narrative) {
+    lines.push("## Executive summary")
+    lines.push("")
+    lines.push(r.narrative)
+    lines.push("")
+  }
+  lines.push("> " + r.verdict)
+  lines.push("")
+  for (const f of r.findings) {
+    if (f.kind === "narrative") continue
+    lines.push("## " + f.title + " (" + f.severity + ")")
+    lines.push("")
+    lines.push(f.summary)
+    lines.push("")
+    if (f.evidence && f.evidence.length) {
+      for (const row of f.evidence) {
+        const mark = row.bad ? " ⚠️" : ""
+        lines.push("- **" + row.label + ":** " + row.value + mark)
+      }
+      lines.push("")
+    }
+  }
+  lines.push("---")
+  lines.push("Generated by hak · scam scanner")
+  return lines.join("\n")
+}

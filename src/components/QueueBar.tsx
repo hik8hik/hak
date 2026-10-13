@@ -1,0 +1,100 @@
+"use client";
+import { useState } from "react";
+import JSZip from "jszip";
+import { useQueue } from "@/context/QueueContext";
+import { toMarkdown } from "@/lib/markdown";
+import { buildQueueHtml } from "@/lib/queueRender";
+import { rasteriseHtml, surfaceColor } from "@/lib/export";
+import { PRESETS, type ExportPreset } from "@/lib/types";
+
+function pixelSize(p: ExportPreset) {
+  return p.w * p.pr + "\u00d7" + p.h * p.pr;
+}
+function pixelTag(p: ExportPreset) {
+  return p.w * p.pr + "x" + p.h * p.pr;
+}
+
+export default function QueueBar() {
+  const { items, clear } = useQueue();
+  const [presetId, setPresetId] = useState<string>("reel4k");
+  const [busy, setBusy] = useState(false);
+  const [progress, setProgress] = useState(0);
+
+  const preset = PRESETS.find((p) => p.id === presetId) || PRESETS[0];
+
+  async function exportZip() {
+    if (busy || items.length === 0) return;
+    setBusy(true);
+    setProgress(0);
+    const zip = new JSZip();
+    const bg = surfaceColor();
+    try {
+      for (let i = 0; i < items.length; i++) {
+        const it = items[i];
+        const html = buildQueueHtml(it, preset);
+        const url = await rasteriseHtml(html, {
+          width: preset.w,
+          height: preset.h,
+          pixelRatio: preset.pr,
+          background: bg,
+        });
+        zip.file(it.id + "-" + pixelTag(preset) + ".png", url.split(",")[1], { base64: true });
+        setProgress((i + 1) / items.length);
+      }
+      const blob = await zip.generateAsync({ type: "blob" });
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = "hak-queue-" + preset.id + ".zip";
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(a.href), 3000);
+    } catch (e) {
+      console.error("[hak] queue export failed", e);
+      alert("Queue export failed: " + String(e) + "\n\nIf you selected 8K, try 4K \u2014 the browser may have hit the canvas size limit.");
+    } finally {
+      setBusy(false);
+      setProgress(0);
+    }
+  }
+
+  function exportMd() {
+    const md = items.map(toMarkdown).join("\n\n---\n\n");
+    const blob = new Blob([md], { type: "text/markdown" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = "hak-queue.md";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 3000);
+  }
+
+  const empty = items.length === 0;
+  const visible = !empty || busy;
+
+  return (
+    <div className="qbar" data-empty={!visible} data-busy={busy ? "true" : "false"}>
+      <span className="small"><b>{items.length}</b> in queue</span>
+      <div className="seg" role="radiogroup" aria-label="Export preset">
+        {PRESETS.map((p) => (
+          <button key={p.id} data-active={presetId === p.id} onClick={() => setPresetId(p.id)} disabled={busy} title={pixelSize(p)}>
+            {p.label}
+          </button>
+        ))}
+      </div>
+      <button className="btn small" onClick={exportZip} disabled={busy || empty}>
+        {busy
+          ? "Exporting " + Math.round(progress * 100) + "%"
+          : "Export " + pixelSize(preset)}
+      </button>
+      <button className="btn small" onClick={exportMd} disabled={busy || empty}>Export MD</button>
+      <button className="btn small" onClick={clear} disabled={busy || empty}>Clear</button>
+      {!busy && (
+        <span className="small muted" title={items.map((i) => i.id).join(", ")}>
+          {items.slice(0, 3).map((i) => i.id).join(" \u00b7 ")}{items.length > 3 ? " \u2026" : ""}
+        </span>
+      )}
+    </div>
+  );
+}

@@ -1,0 +1,124 @@
+import tls from "node:tls";
+import type { EvidenceRow, ScamFinding } from "./types";
+
+interface CertInfo {
+  issuer: string;
+  subject: string;
+  validFrom: string;
+  validTo: string;
+  san: string[];
+  serial: string;
+  fingerprint: string;
+}
+
+function readCert(hostname: string, port = 443, timeout = 6000): Promise<CertInfo | null> {
+  return new Promise((resolve) => {
+    let done = false;
+    const finish = (v: CertInfo | null) => {
+      if (done) return;
+      done = true;
+      try { socket.destroy(); } catch {}
+      resolve(v);
+    };
+    const socket = tls.connect({
+      host: hostname,
+      port,
+      servername: hostname,
+      rejectUnauthorized: false,
+      timeout,
+    }, () => {
+      try {
+        const cert = socket.getPeerCertificate(false)
+        if (!cert || !cert.raw) return finish(null)
+        const issuerParts = [cert.issuer?.O, cert.issuer?.CN].filter(Boolean)
+        const subjectParts = [cert.subject?.O, cert.subject?.CN].filter(Boolean)
+        const sanRaw = cert.subjectaltname || ""
+        const san = sanRaw.split(",").map((s) => s.trim().replace(/^DNS:/, "")).filter(Boolean)
+        finish({
+          issuer: issuerParts.join(" — ") || "unknown",
+          subject: subjectParts.join(" — ") || "unknown",
+          validFrom: cert.valid_from || "",
+          validTo: cert.valid_to || "",
+          san,
+          serial: cert.serialNumber || "",
+          fingerprint: cert.fingerprint256 || "",
+        })
+      } catch { finish(null); }
+    });
+    socket.on("error", () => finish(null));
+    socket.on("timeout", () => finish(null));
+    socket.setTimeout(timeout);
+  });
+}
+
+function daysBetween(iso: string): number | null {
+  const t = Date.parse(iso);
+  if (Number.isNaN(t)) return null;
+  return Math.floor((t - Date.now()) / (1000 * 60 * 60 * 24));
+}
+
+export interface TlsResult {
+  finding: ScamFinding;
+  cert: CertInfo | null;
+}
+
+export async function runTls(hostname: string): Promise<TlsResult> {
+  if (!hostname || /^\d+\.\d+\.\d+\.\d+$/.test(hostname)) {
+    return {
+      finding: {
+        id: "tls", kind: "tls", title: "TLS certificate",
+        summary: "Hostname is a raw IP; certificate lookup skipped.",
+        severity: "info",
+      },
+      cert: null,
+    };
+  }
+  const cert = await readCert(hostname)
+  if (!cert) {
+    return {
+      finding: {
+        id: "tls", kind: "tls", title: "TLS certificate",
+        summary: "Could not establish a TLS session on port 443.",
+        severity: "high",
+        evidence: [{ label: "Host", value: hostname, bad: true }],
+      },
+      cert: null,
+    };
+  }
+
+  const evidence: EvidenceRow[] = []
+  const flags: string[] = []
+  evidence.push({ label: "Issuer", value: cert.issuer })
+  evidence.push({ label: "Subject", value: cert.subject })
+  evidence.push({ label: "Valid from", value: cert.validFrom })
+  const toDays = daysBetween(cert.validTo)
+  evidence.push({ label: "Valid to", value: cert.validTo + (toDays !== null ? " (" + toDays + " days)" : "") })
+  if (toDays !== null && toDays < 0) flags.push("expired")
+  if (toDays !== null && toDays < 15 && toDays >= 0) flags.push("expiring")
+  if (cert.san.length) evidence.push({ label: "SAN count", value: String(cert.san.length) })
+  if (cert.san.length > 0 && cert.san.length <= 6) evidence.push({ label: "SAN entries", value: cert.san.join(", ") })
+  if (cert.fingerprint) evidence.push({ label: "SHA-256 fingerprint", value: cert.fingerprint })
+  if (cert.serial) evidence.push({ label: "Serial", value: cert.serial })
+
+  const issuerLower = cert.issuer.toLowerCase()
+  const selfSigned = /self|localhost|unknown/.test(issuerLower) || cert.issuer === cert.subject
+  if (selfSigned) { flags.push("self-signed"); evidence.push({ label: "Trust", value: "self-signed", bad: true }) }
+
+  if (cert.san.length > 30) {
+    flags.push("shared-cert")
+    evidence.push({ label: "Trust", value: "certificate shared with " + cert.san.length + " domains — possible shared hosting / mass phishing", bad: true })
+  }
+
+  let severity: ScamFinding["severity"] = "info"
+  if (flags.includes("expired") || flags.includes("self-signed")) severity = "high"
+  else if (flags.includes("shared-cert") || flags.includes("expiring")) severity = "medium"
+
+  const summary = flags.length
+    ? flags.join(", ") + "."
+    : "Valid, unexpired certificate from a public CA."
+
+  return {
+    finding: { id: "tls", kind: "tls", title: "TLS certificate", summary, severity, evidence },
+    cert,
+  };
+}

@@ -1,0 +1,144 @@
+"use client";
+import { toCanvas } from "html-to-image";
+
+export interface RecordOpts {
+  width: number;
+  height: number;
+  pixelRatio?: number;
+  frameCount?: number;
+  holdMs?: number;
+  onProgress?: (progress: number) => void;
+}
+
+/** True if this browser can encode a WebM through MediaRecorder. */
+export function animationSupported(): boolean {
+  if (typeof window === "undefined") return false;
+  const w = window as any;
+  if (typeof w.MediaRecorder === "undefined") return false;
+  if (typeof HTMLCanvasElement.prototype.captureStream !== "function") return false;
+  return true;
+}
+
+function pickMime(): string {
+  const w = window as any;
+  if (!w.MediaRecorder || typeof w.MediaRecorder.isTypeSupported !== "function") {
+    return "video/webm";
+  }
+  const candidates = [
+    "video/webm;codecs=vp9",
+    "video/webm;codecs=vp8",
+    "video/webm",
+    "video/mp4",
+  ];
+  for (const c of candidates) {
+    try { if (w.MediaRecorder.isTypeSupported(c)) return c; } catch { /* ignore */ }
+  }
+  return "video/webm";
+}
+
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
+/**
+ * Render `frameCount + 1` progressive states (progress 0..1), snap each to
+ * canvas via html-to-image, and pipe them through MediaRecorder into a Blob.
+ *
+ * The caller supplies `renderFrame(progress)` which returns a fresh DOM
+ * element sized at opts.width × opts.height for that progress value. The
+ * animator owns the canvas, the recorder, and the off-screen host.
+ */
+export async function recordAnimation(
+  renderFrame: (progress: number) => HTMLElement,
+  opts: RecordOpts,
+): Promise<Blob> {
+  const W = Math.max(64, Math.round(opts.width));
+  const H = Math.max(64, Math.round(opts.height));
+  const PR = Math.max(1, opts.pixelRatio ?? 1);
+  const frames = Math.max(2, opts.frameCount ?? 18);
+  const holdMs = Math.max(40, opts.holdMs ?? 220);
+  const onProgress = opts.onProgress ?? (() => {});
+
+  const canvas = document.createElement("canvas");
+  canvas.width = Math.round(W * PR);
+  canvas.height = Math.round(H * PR);
+  const ctx = canvas.getContext("2d");
+  if (!ctx) throw new Error("2D context unavailable");
+
+  const hidden = document.createElement("div");
+  hidden.style.cssText = "position:fixed;top:0;left:-200vw;pointer-events:none;";
+  document.body.appendChild(hidden);
+
+  try { await (document as any).fonts?.ready; } catch { /* ignore */ }
+
+  const stream = (canvas as any).captureStream(0) as MediaStream;
+  const track = stream.getVideoTracks()[0] as any;
+
+  const mime = pickMime();
+  let recorder: MediaRecorder;
+  try {
+    recorder = new MediaRecorder(stream, {
+      mimeType: mime,
+      videoBitsPerSecond: 6_000_000,
+    });
+  } catch (e) {
+    hidden.remove();
+    stream.getTracks().forEach((t) => t.stop());
+    throw new Error("MediaRecorder could not start with " + mime + ": " + String(e));
+  }
+
+  const chunks: Blob[] = [];
+  recorder.ondataavailable = (e) => { if (e.data && e.data.size) chunks.push(e.data); };
+  const stopped = new Promise<void>((resolve) => { recorder.onstop = () => resolve(); });
+
+  recorder.start();
+
+  try {
+    for (let i = 0; i <= frames; i++) {
+      const progress = i / frames;
+      const el = renderFrame(progress);
+      el.style.width = W + "px";
+      el.style.height = H + "px";
+      el.style.boxSizing = "border-box";
+      hidden.appendChild(el);
+      try {
+        const frameCanvas = await toCanvas(el, {
+          width: W,
+          height: H,
+          pixelRatio: PR,
+          cacheBust: false,
+        });
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        ctx.drawImage(frameCanvas, 0, 0, canvas.width, canvas.height);
+        if (typeof track.requestFrame === "function") track.requestFrame();
+        onProgress(progress);
+        await sleep(holdMs);
+      } finally {
+        hidden.removeChild(el);
+      }
+    }
+    // Hold the final frame so the encoder flushes it before we stop.
+    await sleep(600);
+  } finally {
+    try { recorder.stop(); } catch { /* ignore */ }
+    await stopped.catch(() => {});
+    try { track.stop && track.stop(); } catch { /* ignore */ }
+    stream.getTracks().forEach((t) => { try { t.stop(); } catch { /* ignore */ } });
+    if (hidden.parentNode) hidden.parentNode.removeChild(hidden);
+  }
+
+  const blob = new Blob(chunks, { type: mime.split(";")[0] });
+  if (blob.size < 20_000) {
+    console.warn("[hak] animated export is suspiciously small:", blob.size, "bytes");
+  }
+  return blob;
+}
+
+export function downloadBlob(blob: Blob, filename: string) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 3000);
+}

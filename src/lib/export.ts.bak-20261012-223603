@@ -1,0 +1,19 @@
+import { toPng } from "html-to-image";
+
+export interface RasterOpts { width: number; height: number; pixelRatio: number; background?: string; }
+
+export async function rasterise(el: HTMLElement, opts: RasterOpts): Promise<string> {
+  const url = await toPng(el, {
+    width: opts.width, height: opts.height, pixelRatio: opts.pixelRatio,
+    backgroundColor: opts.background, cacheBust: true, skipFonts: false,
+    style: { margin: "0" },
+  });
+  if (url.length < 5000) console.warn("[hak] blank export — length=" + url.length);
+  return url;
+}
+
+export function download(dataUrl: string, filename: string) {
+  const a = document.createElement("a");
+  a.href = dataUrl; a.download = filename;
+  document.body.appendChild(a); a.click(); a.remove();
+}
